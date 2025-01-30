@@ -25,9 +25,7 @@
 #include <windows.h>
 #endif
 
-#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
 #include <openssl/provider.h>
-#endif
 #include <openssl/ui.h>
 
 #include <QTextStream>
@@ -118,25 +116,23 @@ int main(int argc, char *argv[])
 		is_gui_app = true;
 	}
 
-#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
-	{
-		QString path;
+	QString path;
 #if defined(Q_OS_WIN32)
-		path = QCoreApplication::applicationDirPath();
+	path = QCoreApplication::applicationDirPath();
 #elif defined(Q_OS_MACOS)
-		path = QCoreApplication::applicationDirPath() + "/../PlugIns";
+	path = QCoreApplication::applicationDirPath() + "/../PlugIns";
 #endif
-		if (!path.isEmpty()) {
-			OSSL_PROVIDER_set_default_search_path(NULL, path.toUtf8().data());
-			qDebug() << "OSSL_PROVIDER_set_default_search_path" << path;
-		}
+	if (!path.isEmpty()) {
+		OSSL_PROVIDER_set_default_search_path(NULL, path.toUtf8().data());
+		qDebug() << "OSSL_PROVIDER_set_default_search_path" << path;
 	}
+
 	MainWindow::legacy_loaded = OSSL_PROVIDER_try_load(0, "legacy", 1);
 	if (MainWindow::legacy_loaded)
 		qDebug() << "Legacy provider loaded";
 	else
 		qWarning() << "Legacy provider NOT loaded";
-#endif
+
 	QSharedPointer<UI_METHOD> uimeth(
 			UI_create_method("xca-method"), UI_destroy_method);
 	UI_method_set_writer(uimeth.data(), uiwriter);

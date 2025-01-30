@@ -13,7 +13,6 @@
 #include "entropy.h"
 #include "BioByteArray.h"
 #include "XcaProgress.h"
-#include "openssl_compat.h"
 
 #include "PwDialogCore.h"
 #include "XcaWarningCore.h"
@@ -23,9 +22,7 @@
 #include <openssl/pem.h>
 #include <openssl/pkcs12.h>
 #include <openssl/err.h>
-#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
 #include <openssl/proverr.h>
-#endif
 
 Passwd pki_evp::passwd;
 
@@ -225,9 +222,7 @@ bool pki_evp::openssl_pw_error() const
 	case ERR_PACK(ERR_LIB_PEM, 0, PEM_R_BAD_DECRYPT):
 	case ERR_PACK(ERR_LIB_PEM, 0, PEM_R_BAD_PASSWORD_READ):
 	case ERR_PACK(ERR_LIB_EVP, 0, EVP_R_BAD_DECRYPT):
-#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
 	case ERR_PACK(ERR_LIB_PROV, 0, PROV_R_BAD_DECRYPT):
-#endif
 	case ERR_PACK(ERR_LIB_PKCS12, 0, PKCS12_R_PKCS12_CIPHERFINAL_ERROR):
 		pki_ign_openssl_error();
 		return true;

@@ -19,7 +19,7 @@ builtin_curves.h	pki_temp.h
 database_model.cpp	oid.cpp			pki_x509.cpp
 database_model.h	oid.h			pki_x509.h
 db_base.cpp		opensc-pkcs11.h		pki_x509req.cpp
-db_base.h		openssl_compat.h	pki_x509req.h
+db_base.h		pki_x509req.h
 db_crl.cpp		pass_info.cpp		pki_x509super.cpp
 db_crl.h		pass_info.h		pki_x509super.h
 db_key.cpp		pk11_attribute.cpp	settings.cpp

@@ -9,11 +9,7 @@
 #include <QFile>
 
 #include <openssl/opensslv.h>
-#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
 #include <openssl/provider.h>
-#else
-#define OSSL_PROVIDER_try_load(a,b,c) do{}while(0)
-#endif
 
 #include "widgets/MainWindow.h"
 #include "ui_MainWindow.h"

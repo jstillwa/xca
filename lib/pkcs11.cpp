@@ -661,11 +661,7 @@ static int eng_finish(ENGINE *e)
 	return 1;
 }
 
-#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
 static int eng_pmeth_copy(EVP_PKEY_CTX *dst, const EVP_PKEY_CTX *src)
-#else
-static int eng_pmeth_copy(EVP_PKEY_CTX *dst, EVP_PKEY_CTX *src)
-#endif
 {
 	void *p = EVP_PKEY_CTX_get_app_data((EVP_PKEY_CTX *)src);
 	EVP_PKEY_CTX_set_app_data(dst,  p);

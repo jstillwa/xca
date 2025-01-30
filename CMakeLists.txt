@@ -64,7 +64,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC_SEARCH_PATHS "${PROJECT_SOURCE_DIR}/ui")
 set(CMAKE_AUTOUIC ON)
-add_compile_definitions(OPENSSL_SUPPRESS_DEPRECATED QT_MESSAGELOGCONTEXT)
+add_compile_definitions(QT_MESSAGELOGCONTEXT)
 
 add_compile_options(-Wall -Wextra -Wno-unknown-pragmas)
 if (ADDRESS_SANITIZER)
@@ -88,11 +88,6 @@ add_executable(xcaexport ${PROJECT_BINARY_DIR}/local.h)
 
 include_directories(${PROJECT_BINARY_DIR} ${PROJECT_SOURCE_DIR})
 
-if (NOT OPENSSL_VERSION)
-  # Educated guess
-  set(OPENSSL_VERSION 3.0.0)
-endif()
-
 if (APPLE)
   execute_process(COMMAND brew --prefix OUTPUT_STRIP_TRAILING_WHITESPACE
                   OUTPUT_VARIABLE BREW_PREFIX ERROR_QUIET)
@@ -103,11 +98,6 @@ if (APPLE)
 elseif(WIN32)
   if (NOT CMAKE_PREFIX_PATH)
     set(CMAKE_PREFIX_PATH $ENV{UserProfile} $ENV{PROGRAMFILES}/OpenSSL-Win64)
-  endif()
-  if (OPENSSL_VERSION VERSION_GREATER_EQUAL 3.0.0)
-    set(OPENSSL_LIBRARY_MAJOR "3")
-  else()
-    set(OPENSSL_LIBRARY_MAJOR "1_1")
   endif()
   file(TO_CMAKE_PATH $ENV{WINDIR}/system32 SYSTEM32)
 endif()
@@ -298,7 +288,7 @@ elseif(WIN32)
         ${CMAKE_BINARY_DIR}/libstdc++-6.dll
         ${CMAKE_BINARY_DIR}/libwinpthread-1.dll
         ${SYSTEM32}/vcruntime140.dll
-        ${OPENSSL_ROOT_DIR}/bin/libcrypto-${OPENSSL_LIBRARY_MAJOR}-x64.dll
+        ${OPENSSL_ROOT_DIR}/bin/libcrypto-3-x64.dll
       DESTINATION ${RUNTIME_DEST}
   )
   install(CODE "execute_process(COMMAND cmake -E chdir \${CMAKE_INSTALL_PREFIX} tar cvf ${RUNTIME_DEST}.zip --format=zip -- ${RUNTIME_DEST})")
