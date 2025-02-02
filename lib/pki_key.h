@@ -243,21 +243,16 @@ class pki_key: public pki_base
 		bool pem(BioByteArray &);
 		virtual bool pem(BioByteArray &b, const pki_export *xport);
 		QVariant column_data(const dbheader *hd) const;
-		QString modulus() const;
-		QString pubEx() const;
-		QString subprime() const;
-		QString pubkey() const;
 		QString base64UrlEncodeParam(const EVP_PKEY *pkey,
 						const char *param, int bits = 0) const;
 		void ssh_key_bn2dataParam(const EVP_PKEY *pkey, const char *param,
 						QByteArray *data) const;
+		QString BignumParam(const char *param_name) const;
 
 #ifndef OPENSSL_NO_EC
 		int ecParamNid() const;
-		QString ecPubKey() const;
 		QByteArray ed25519PubKey() const;
 		QByteArray ed25519PrivKey(const EVP_PKEY *pkey) const;
-		BIGNUM *ecPubKeyBN() const;
 #endif
 		void d2i(QByteArray &ba);
 		void d2i_old(QByteArray &ba, int type);

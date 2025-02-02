@@ -20,6 +20,8 @@
 #include <QPushButton>
 #include <QLineEdit>
 
+#include <openssl/core_names.h>
+
 KeyDetail::KeyDetail(QWidget *w) : XcaDetail(w)
 {
 	setupUi(this);
@@ -104,15 +106,15 @@ void KeyDetail::setKey(pki_key *key, bool import)
 	}
 	switch (key->getKeyType()) {
 		case EVP_PKEY_RSA:
-			keyPubEx->setText(key->pubEx());
-			keyModulus->setText(key->modulus());
+			keyPubEx->setText(key->BignumParam(OSSL_PKEY_PARAM_RSA_E));
+			keyModulus->setText(key->BignumParam(OSSL_PKEY_PARAM_RSA_N));
 			break;
 		case EVP_PKEY_DSA:
 			tlPubEx->setText(tr("Sub prime"));
 			tlModulus->setTitle(tr("Public key"));
 			tlPrivEx->setText(tr("Private key"));
-			keyPubEx->setText(key->subprime());
-			keyModulus->setText(key->pubkey());
+			keyPubEx->setText(key->BignumParam(OSSL_PKEY_PARAM_FFC_Q));
+			keyModulus->setText(key->BignumParam(OSSL_PKEY_PARAM_PUB_KEY));
 			break;
 #ifndef OPENSSL_NO_EC
 		case EVP_PKEY_EC:
@@ -126,7 +128,7 @@ void KeyDetail::setKey(pki_key *key, bool import)
 				MainWindow::getResolver(),
 				SLOT(searchOid(QString)));
 			keyPubEx->setToolTip(CurveComment(nid));
-			keyModulus->setText(key->ecPubKey());
+			keyModulus->setText(key->BignumParam(OSSL_PKEY_PARAM_PUB_KEY));
 			break;
 #ifdef EVP_PKEY_ED25519
 		case EVP_PKEY_ED25519:

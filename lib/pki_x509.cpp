@@ -856,8 +856,7 @@ bool pki_x509::compareNameAndKey(pki_x509 *other)
 	pki_ign_openssl_error();
 	if (!pub1 || !pub2)
 		return false;
-	/* EVP_PKEY_cmp() return 1 if the keys match */
-	r = EVP_PKEY_cmp(pub1, pub2);
+	r = EVP_PKEY_eq(pub1, pub2);
 	pki_openssl_error();
 	return r == 1;
 }

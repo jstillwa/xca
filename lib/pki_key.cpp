@@ -116,10 +116,7 @@ QString pki_key::getJWKcrv() const
 	const char *name = nullptr;
 #ifndef OPENSSL_NO_EC
 	if (getKeyType() == EVP_PKEY_EC) {
-		char gname[80];
-		if (EVP_PKEY_get_group_name(key, gname, sizeof gname, nullptr) <= 0)
-			return QString();
-		int nid = OBJ_txt2nid(gname);
+		int nid = ecParamNid();
 		switch (nid) {
 		case NID_X9_62_prime256v1:
 		case NID_secp384r1:
@@ -259,83 +256,13 @@ int pki_key::getKeyType() const
 	return EVP_PKEY_id(key);
 }
 
-QString pki_key::modulus() const
-{
-	if (getKeyType() == EVP_PKEY_RSA) {
-		const BIGNUM *n = NULL;
-
-		const RSA *rsa = EVP_PKEY_get0_RSA(key);
-		RSA_get0_key(rsa, &n, NULL, NULL);
-		return BN2QString(n);
-	}
-	return QString();
-}
-
-QString pki_key::pubEx() const
-{
-	if (getKeyType() == EVP_PKEY_RSA) {
-		const BIGNUM *e = NULL;
-		const RSA *rsa = EVP_PKEY_get0_RSA(key);
-		RSA_get0_key(rsa, NULL, &e, NULL);
-		return BN2QString(e);
-	}
-	return QString();
-}
-
-QString pki_key::subprime() const
-{
-	if (getKeyType() == EVP_PKEY_DSA) {
-		const BIGNUM *q = NULL;
-		const DSA *dsa = EVP_PKEY_get0_DSA(key);
-		if (dsa)
-			DSA_get0_pqg(dsa, NULL, &q, NULL);
-		return BN2QString(q);
-	}
-	return QString();
-}
-
-QString pki_key::pubkey() const
-{
-	if (getKeyType() == EVP_PKEY_DSA) {
-		const BIGNUM *pubkey = NULL;
-		const DSA *dsa = EVP_PKEY_get0_DSA(key);
-		if (dsa)
-			DSA_get0_key(dsa, &pubkey, NULL);
-		return BN2QString(pubkey);
-	}
-	return QString();
-}
 #ifndef OPENSSL_NO_EC
 int pki_key::ecParamNid() const
 {
-	const EC_KEY *ec;
-
-	if (getKeyType() != EVP_PKEY_EC)
+	char gname[80];
+	if (EVP_PKEY_get_group_name(key, gname, sizeof gname, nullptr) <= 0)
 		return NID_undef;
-	ec = EVP_PKEY_get0_EC_KEY(key);
-	return EC_GROUP_get_curve_name(EC_KEY_get0_group(ec));
-}
-
-BIGNUM *pki_key::ecPubKeyBN() const
-{
-	if (getKeyType() != EVP_PKEY_EC)
-		return NULL;
-
-	const EC_KEY *ec = EVP_PKEY_get0_EC_KEY(key);
-	return EC_POINT_point2bn(EC_KEY_get0_group(ec),
-				 EC_KEY_get0_public_key(ec),
-				 EC_KEY_get_conv_form(ec), NULL, NULL);
-}
-
-QString pki_key::ecPubKey() const
-{
-	QString pub;
-	BIGNUM *pub_key = ecPubKeyBN();
-	if (pub_key) {
-		pub = BN2QString(pub_key);
-		BN_free(pub_key);
-	}
-	return pub;
+	return OBJ_txt2nid(gname);
 }
 
 #ifdef EVP_PKEY_ED25519
@@ -417,7 +344,7 @@ bool pki_key::compare(const pki_base *ref) const
 	if (!kref || !kref->key || !key)
 		return false;
 
-	int r = EVP_PKEY_cmp(key, kref->key);
+	int r = EVP_PKEY_eq(key, kref->key);
 	pki_openssl_error();
 	return r == 1;
 }
@@ -442,6 +369,17 @@ QString pki_key::BN2QString(const BIGNUM *bn) const
 		hex += ba.mid(i, 16).toHex(':') + '\n';
 	hex.chop(1);
 	return QString::fromLatin1(hex);
+}
+
+QString pki_key::BignumParam(const char *param_name) const
+{
+	BIGNUM *bn = nullptr;
+	QString ret;
+	if (EVP_PKEY_get_bn_param(key, param_name, &bn) > 0)
+		ret = BN2QString(bn);
+	if(bn)
+		BN_free(bn);
+	return ret;
 }
 
 QVariant pki_key::column_data(const dbheader *hd) const
