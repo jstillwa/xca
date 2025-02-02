@@ -247,6 +247,10 @@ class pki_key: public pki_base
 		QString pubEx() const;
 		QString subprime() const;
 		QString pubkey() const;
+		QString base64UrlEncodeParam(const EVP_PKEY *pkey,
+						const char *param, int bits = 0) const;
+		void ssh_key_bn2dataParam(const EVP_PKEY *pkey, const char *param,
+						QByteArray *data) const;
 
 #ifndef OPENSSL_NO_EC
 		int ecParamNid() const;

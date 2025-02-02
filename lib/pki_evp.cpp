@@ -23,6 +23,7 @@
 #include <openssl/pkcs12.h>
 #include <openssl/err.h>
 #include <openssl/proverr.h>
+#include <openssl/core_names.h>
 
 Passwd pki_evp::passwd;
 
@@ -91,71 +92,45 @@ void pki_evp::generate(const keyjob &task)
 	Entropy::seed_rng();
 	XcaProgress progress;
 
-	BN_GENCB *bar = BN_GENCB_new();
-	BN_GENCB_set_old(bar, XcaProgress::inc, &progress);
+	EVP_PKEY *param_key = nullptr;
+
+	EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(task.ktype.type, NULL);
+	Q_CHECK_PTR(ctx);
+	EVP_PKEY_CTX_set_app_data(ctx, &progress);
 
 	switch (task.ktype.type) {
-	case EVP_PKEY_RSA: {
-		RSA *rsakey = RSA_new();
-		BIGNUM *e = BN_new();
-		BN_set_word(e, 0x10001);
-		if (RSA_generate_key_ex(rsakey, task.size, e, bar))
-			EVP_PKEY_assign_RSA(key, rsakey);
-		else
-			RSA_free(rsakey);
-		BN_free(e);
+	case EVP_PKEY_RSA:
+		EVP_PKEY_CTX_set_rsa_keygen_bits(ctx, task.size);
 		break;
-	}
-	case EVP_PKEY_DSA: {
-		DSA *dsakey = DSA_new();
-		if (DSA_generate_parameters_ex(dsakey, task.size, NULL, 0,
-			 NULL, NULL, bar) && DSA_generate_key(dsakey))
-				EVP_PKEY_assign_DSA(key, dsakey);
-		else
-			DSA_free(dsakey);
+	case EVP_PKEY_DSA:
+		EVP_PKEY_paramgen_init(ctx);
+		EVP_PKEY_CTX_set_dsa_paramgen_bits(ctx, task.size);
+		EVP_PKEY_generate(ctx, &param_key);
+
+		EVP_PKEY_CTX_free(ctx);
+		ctx = EVP_PKEY_CTX_new_from_pkey(NULL, param_key, NULL);
 		break;
-	}
 #ifndef OPENSSL_NO_EC
-	case EVP_PKEY_EC: {
-		EC_KEY *eckey;
-		EC_GROUP *group = EC_GROUP_new_by_curve_name(task.ec_nid);
-		if (!group)
-			break;
-		eckey = EC_KEY_new();
-		if (eckey == NULL) {
-			EC_GROUP_free(group);
-			break;
-		}
-		EC_GROUP_set_asn1_flag(group, 1);
-		if (EC_KEY_set_group(eckey, group)) {
-			if (EC_KEY_generate_key(eckey)) {
-				EVP_PKEY_assign_EC_KEY(key, eckey);
-				EC_GROUP_free(group);
-				break;
-			}
-		}
-		EC_KEY_free(eckey);
-		EC_GROUP_free(group);
+	case EVP_PKEY_EC:
+		EVP_PKEY_CTX_set_ec_paramgen_curve_nid(ctx, task.ec_nid);
 		break;
-	}
-#ifdef EVP_PKEY_ED25519
-	case EVP_PKEY_ED25519: {
-		EVP_PKEY *pkey = NULL;
-		EVP_PKEY_CTX *pctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
-		Q_CHECK_PTR(pctx);
-		EVP_PKEY_keygen_init(pctx);
-		EVP_PKEY_keygen(pctx, &pkey);
-		EVP_PKEY_CTX_free(pctx);
-		EVP_PKEY_free(key);
-		key = pkey;
-	}
-#endif
+	case EVP_PKEY_ED25519:
+		// ED25519 and ED448 need no extra treatment
+		break;
 #endif
 	}
-	BN_GENCB_free(bar);
+	EVP_PKEY *pkey = nullptr;
+	EVP_PKEY_keygen_init(ctx);
+	EVP_PKEY_keygen(ctx, &pkey);
+	EVP_PKEY_CTX_free(ctx);
 	isPub = false;
 	pkiSource = generated;
 	pki_openssl_error();
+	if (param_key)
+		EVP_PKEY_free(param_key);
+	if (key)
+		EVP_PKEY_free(key);
+	key = pkey;
 	encryptKey();
 }
 
@@ -179,32 +154,12 @@ pki_evp::pki_evp(const QString &n, int type)
 
 static bool EVP_PKEY_isPrivKey(EVP_PKEY *key)
 {
-	const BIGNUM *b;
-	int keytype = EVP_PKEY_id(key);
-
-	switch (EVP_PKEY_type(keytype)) {
-		case EVP_PKEY_RSA:
-			RSA_get0_key(EVP_PKEY_get0_RSA(key), NULL, NULL, &b);
-			return b ? true: false;
-		case EVP_PKEY_DSA:
-			DSA_get0_key(EVP_PKEY_get0_DSA(key), NULL, &b);
-			return b ? true: false;
-#ifndef OPENSSL_NO_EC
-		case EVP_PKEY_EC:
-			return EC_KEY_get0_private_key(
-				EVP_PKEY_get0_EC_KEY(key)) ? true: false;
-#ifdef EVP_PKEY_ED25519
-		case EVP_PKEY_ED25519: {
-			unsigned char buf[ED25519_KEYLEN];
-			size_t len = sizeof buf;
-			int ret = EVP_PKEY_get_raw_private_key(key, buf, &len);
-			ign_openssl_error();
-			return ret && len == ED25519_KEYLEN;
-		}
-#endif
-#endif
-	}
-	return false;
+	EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_from_pkey(NULL, key, NULL);
+	Q_CHECK_PTR(ctx);
+	bool priv = EVP_PKEY_private_check(ctx) > 0;
+	EVP_PKEY_CTX_free(ctx);
+	ign_openssl_error();
+	return priv;
 }
 
 pki_evp::pki_evp(EVP_PKEY *pkey)
@@ -257,44 +212,6 @@ void pki_evp::fromPEMbyteArray(const QByteArray &ba, const QString &name)
 	set_EVP_PKEY(pkey, name);
 }
 
-static void search_ec_oid(EVP_PKEY *pkey)
-{
-#ifndef OPENSSL_NO_EC
-	EC_GROUP *builtin;
-	const EC_KEY *ec;
-	const EC_GROUP *ec_group;
-
-	int keytype = EVP_PKEY_id(pkey);
-
-	if (keytype != EVP_PKEY_EC)
-		return;
-
-	ec = EVP_PKEY_get0_EC_KEY(pkey);
-	if (!ec)
-		return;
-
-	ec_group = EC_KEY_get0_group(ec);
-	if (!ec_group)
-		return;
-	if (EC_GROUP_get_curve_name(ec_group))
-		return;
-	/* There is an EC_GROUP with a missing OID
-	 * because of explicit parameters */
-	foreach(builtin_curve curve, builtinCurves) {
-		builtin = EC_GROUP_new_by_curve_name(curve.nid);
-		if (EC_GROUP_cmp(builtin, ec_group, NULL) == 0) {
-			EC_GROUP_set_curve_name((EC_GROUP *)ec_group, curve.nid);
-			EC_GROUP_set_asn1_flag((EC_GROUP *)ec_group, 1);
-			EC_GROUP_free(builtin);
-			break;
-		}
-		EC_GROUP_free(builtin);
-	}
-#else
-	(void)pkey;
-#endif
-}
-
 void pki_evp::set_EVP_PKEY(EVP_PKEY *pkey, QString name)
 {
 	if (!pkey)
@@ -310,7 +227,6 @@ void pki_evp::set_EVP_PKEY(EVP_PKEY *pkey, QString name)
 	isPub = !EVP_PKEY_isPrivKey(key);
 	if (!isPub)
 		bogusEncryptKey();
-	search_ec_oid(pkey);
 
 	autoIntName(name);
 	setFilename(name);
@@ -563,10 +479,6 @@ EVP_PKEY *pki_evp::legacyDecryptKey(QByteArray &myencKey,
 	OPENSSL_free(p);
 	EVP_CIPHER_CTX_free(ctx);
 	pki_openssl_error();
-	if (EVP_PKEY_type(getKeyType()) == EVP_PKEY_RSA) {
-		RSA *rsa = EVP_PKEY_get1_RSA(tmpkey);
-		RSA_blinding_on(rsa, NULL);
-	}
 	myencKey.fill(0);
 	return tmpkey;
 }
@@ -815,29 +727,19 @@ void pki_evp::fillJWK(QJsonObject &json, const pki_export *xport) const
 	EVP_PKEY *pkey = decryptKey();
 
 	switch (getKeyType()) {
-	case EVP_PKEY_RSA: {
-		const RSA *rsa = EVP_PKEY_get0_RSA(pkey);
-		const BIGNUM *p, *q, *d, *dp, *dq, *qi;
-		Q_CHECK_PTR(rsa);
-		RSA_get0_key(rsa, NULL, NULL, &d);
-		RSA_get0_factors(rsa, &p, &q);
-		RSA_get0_crt_params(rsa, &dp, &dq, &qi);
-		json["p"] = base64UrlEncode(p);
-		json["q"] = base64UrlEncode(q);
-		json["d"] = base64UrlEncode(d);
-		json["dp"] = base64UrlEncode(dp);
-		json["dq"] = base64UrlEncode(dq);
-		json["qi"] = base64UrlEncode(qi);
+	case EVP_PKEY_RSA:
+		json["p"] = base64UrlEncodeParam(pkey, OSSL_PKEY_PARAM_RSA_FACTOR1);
+		json["q"] = base64UrlEncodeParam(pkey, OSSL_PKEY_PARAM_RSA_FACTOR2);
+		json["d"] = base64UrlEncodeParam(pkey, OSSL_PKEY_PARAM_RSA_D);
+		json["dp"] = base64UrlEncodeParam(pkey, OSSL_PKEY_PARAM_RSA_EXPONENT1);
+		json["dq"] = base64UrlEncodeParam(pkey, OSSL_PKEY_PARAM_RSA_EXPONENT2);
+		json["qi"] = base64UrlEncodeParam(pkey, OSSL_PKEY_PARAM_RSA_COEFFICIENT1);
 		break;
-		}
 #ifndef OPENSSL_NO_EC
-	case EVP_PKEY_EC: {
-		const EC_KEY *ec = EVP_PKEY_get0_EC_KEY(pkey);
-		Q_CHECK_PTR(ec);
-		json["d"] = base64UrlEncode(EC_KEY_get0_private_key(ec),
-		                            EVP_PKEY_bits(key));
+	case EVP_PKEY_EC:
+		int bits = EVP_PKEY_bits(pkey);
+		json["d"] = base64UrlEncodeParam(pkey, OSSL_PKEY_PARAM_PRIV_KEY, bits);
 		break;
-		}
 #endif
 	}
 	EVP_PKEY_free(pkey);

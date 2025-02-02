@@ -16,6 +16,9 @@
 
 #include <openssl/rand.h>
 #include <openssl/pem.h>
+#include <openssl/params.h>
+#include <openssl/core_names.h>
+#include <openssl/param_build.h>
 
 builtin_curves builtinCurves;
 keyjob keyjob::defaultjob;
@@ -113,8 +116,10 @@ QString pki_key::getJWKcrv() const
 	const char *name = nullptr;
 #ifndef OPENSSL_NO_EC
 	if (getKeyType() == EVP_PKEY_EC) {
-		const EC_KEY *ec = EVP_PKEY_get0_EC_KEY(key);
-		int nid = EC_GROUP_get_curve_name(EC_KEY_get0_group(ec));
+		char gname[80];
+		if (EVP_PKEY_get_group_name(key, gname, sizeof gname, nullptr) <= 0)
+			return QString();
+		int nid = OBJ_txt2nid(gname);
 		switch (nid) {
 		case NID_X9_62_prime256v1:
 		case NID_secp384r1:
@@ -130,38 +135,36 @@ QString pki_key::getJWKcrv() const
 	return QString(name);
 }
 
+QString pki_key::base64UrlEncodeParam(const EVP_PKEY *pkey,
+			const char *param, int bits) const
+{
+	BIGNUM *bn = nullptr;
+	QString ret;
+	if (EVP_PKEY_get_bn_param(pkey, param, &bn) > 0)
+		ret = base64UrlEncode(bn, bits);
+	if(bn)
+		BN_free(bn);
+	return ret;
+}
+
 void pki_key::fillJWK(QJsonObject &json, const pki_export *) const
 {
 	json["kid"] = getIntName();
 
 	switch (getKeyType()) {
 	case EVP_PKEY_RSA: {
-		const RSA *rsa = EVP_PKEY_get0_RSA(key);
-		Q_CHECK_PTR(rsa);
-		const BIGNUM *n, *e;
-		RSA_get0_key(rsa, &n, &e, NULL);
-		json["n"] = base64UrlEncode(n);
-		json["e"] = base64UrlEncode(e);
+		json["n"] = base64UrlEncodeParam(key, OSSL_PKEY_PARAM_RSA_N);
+		json["e"] = base64UrlEncodeParam(key, OSSL_PKEY_PARAM_RSA_E);
 		json["kty"] = "RSA";
 		break;
 		}
 #ifndef OPENSSL_NO_EC
 	case EVP_PKEY_EC: {
-		const EC_KEY *ec = EVP_PKEY_get0_EC_KEY(key);
-		BIGNUM *x = BN_new(), *y = BN_new();
-		Q_CHECK_PTR(x);
-		Q_CHECK_PTR(y);
-		if (EC_POINT_get_affine_coordinates_GFp(EC_KEY_get0_group(ec),
-			EC_KEY_get0_public_key(ec), x, y, NULL))
-		{
-			int bits = EVP_PKEY_bits(key);
-			json["x"] = base64UrlEncode(x, bits);
-			json["y"] = base64UrlEncode(y, bits);
-			json["kty"] = "EC";
-			json["crv"] = getJWKcrv();
-		}
-		BN_free(x);
-		BN_free(y);
+		int bits = EVP_PKEY_bits(key);
+		json["x"] = base64UrlEncodeParam(key, OSSL_PKEY_PARAM_EC_PUB_X, bits);
+		json["y"] = base64UrlEncodeParam(key, OSSL_PKEY_PARAM_EC_PUB_Y, bits);
+		json["kty"] = "EC";
+		json["crv"] = getJWKcrv();
 		break;
 		}
 #endif
@@ -170,19 +173,6 @@ void pki_key::fillJWK(QJsonObject &json, const pki_export *) const
 
 QString pki_key::length() const
 {
-	bool dsa_unset = false;
-
-	if (getKeyType() == EVP_PKEY_DSA) {
-		const BIGNUM *p = NULL;
-		const DSA *dsa = EVP_PKEY_get0_DSA(key);
-		if (dsa)
-			DSA_get0_pqg(dsa, &p, NULL, NULL);
-		dsa_unset = p == NULL;
-	}
-
-	if (dsa_unset)
-		return QString("???");
-
 	return QString("%1 bit").arg(EVP_PKEY_bits(key));
 }
 
@@ -602,6 +592,7 @@ EVP_PKEY *pki_key::load_ssh2_key(const QByteArray &b)
 	QStringList sl;
 	EVP_PKEY *pk = NULL;
 	QByteArray ba(b);
+	int keytype = -1;
 
 #if (QT_VERSION >= QT_VERSION_CHECK(5, 14, 0))
 	sl = QString(ba).split(" ", Qt::SkipEmptyParts);
@@ -611,54 +602,39 @@ EVP_PKEY *pki_key::load_ssh2_key(const QByteArray &b)
 	if (sl.size() < 2)
 		return NULL;
 
+	QMap<const char *, BIGNUM*> params;
+	QSharedPointer<OSSL_PARAM_BLD> bld(OSSL_PARAM_BLD_new(),
+				OSSL_PARAM_BLD_free);
+	Q_CHECK_PTR(bld.get());
+
 	ba = QByteArray::fromBase64(sl[1].toLatin1());
 	if (sl[0].startsWith("ssh-rsa")) {
+		keytype = EVP_PKEY_RSA;
 		ssh_key_check_chunk(&ba, "ssh-rsa");
 
-		BIGNUM *e = ssh_key_data2bn(&ba);
-		BIGNUM *n = ssh_key_data2bn(&ba);
-
-		RSA *rsa = RSA_new();
-		Q_CHECK_PTR(rsa);
-		RSA_set0_key(rsa, n, e, NULL);
-		pk = EVP_PKEY_new();
-		Q_CHECK_PTR(pk);
-		EVP_PKEY_assign_RSA(pk, rsa);
+		params[OSSL_PKEY_PARAM_RSA_E] = ssh_key_data2bn(&ba);
+		params[OSSL_PKEY_PARAM_RSA_N] = ssh_key_data2bn(&ba);
 	} else if (sl[0].startsWith("ssh-dss")) {
+		keytype = EVP_PKEY_DSA;
 		ssh_key_check_chunk(&ba, "ssh-dss");
-		BIGNUM *p = ssh_key_data2bn(&ba);
-		BIGNUM *q = ssh_key_data2bn(&ba);
-		BIGNUM *g = ssh_key_data2bn(&ba);
-		BIGNUM *pubkey = ssh_key_data2bn(&ba);
-		DSA *dsa = DSA_new();
-		Q_CHECK_PTR(dsa);
 
-		DSA_set0_pqg(dsa, p, q, g);
-		DSA_set0_key(dsa, pubkey, NULL);
+		params[OSSL_PKEY_PARAM_FFC_P] = ssh_key_data2bn(&ba);
+		params[OSSL_PKEY_PARAM_FFC_Q] = ssh_key_data2bn(&ba);
+		params[OSSL_PKEY_PARAM_FFC_G] = ssh_key_data2bn(&ba);
+		params[OSSL_PKEY_PARAM_PUB_KEY] = ssh_key_data2bn(&ba);
 
-		pk = EVP_PKEY_new();
-		Q_CHECK_PTR(pk);
-		EVP_PKEY_assign_DSA(pk, dsa);
 #ifndef OPENSSL_NO_EC
 	} else if (sl[0].startsWith("ecdsa-sha2-nistp256")) {
-		EC_KEY *ec;
+		keytype = EVP_PKEY_EC;
 
 		/* Skip "ecdsa-sha2..." */
 		ssh_key_check_chunk(&ba, "ecdsa-sha2-nistp256");
 		ssh_key_check_chunk(&ba, "nistp256");
-		BIGNUM *bn = ssh_key_data2bn(&ba);
 
-		ec = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
-		Q_CHECK_PTR(ec);
-		EC_KEY_set_asn1_flag(ec, OPENSSL_EC_NAMED_CURVE);
-		EC_KEY_set_public_key(ec, EC_POINT_bn2point(
-					EC_KEY_get0_group(ec), bn, NULL, NULL));
-		BN_free(bn);
-		pki_openssl_error();
+		params[OSSL_PKEY_PARAM_PUB_KEY] = ssh_key_data2bn(&ba);
+		OSSL_PARAM_BLD_push_utf8_string(bld.get(), OSSL_PKEY_PARAM_GROUP_NAME,
+					OBJ_nid2sn(NID_X9_62_prime256v1), 0);
 
-		pk = EVP_PKEY_new();
-		Q_CHECK_PTR(pk);
-		EVP_PKEY_assign_EC_KEY(pk, ec);
 #ifdef EVP_PKEY_ED25519
 	} else if (sl[0].startsWith("ssh-ed25519")) {
 		ssh_key_check_chunk(&ba, "ssh-ed25519");
@@ -671,6 +647,27 @@ EVP_PKEY *pki_key::load_ssh2_key(const QByteArray &b)
 	} else {
 		throw errorEx(tr("Unexpected SSH2 content: '%1'").arg(sl[0]));
 	}
+	if (!pk) {
+		// Need to generate key from parameters
+		EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(keytype, nullptr);
+		Q_CHECK_PTR(ctx);
+		pki_openssl_error();
+		if (EVP_PKEY_fromdata_init(ctx) <= 0)
+			return nullptr;
+		for (auto i = params.cbegin(), end = params.cend(); i != end; ++i) {
+			OSSL_PARAM_BLD_push_BN(bld.get(), i.key(), i.value());
+			pki_openssl_error();
+			qDebug() << qPrintable(i.key()) << ": "
+					 << BioByteArray(i.value()).qstring();
+		}
+		OSSL_PARAM *pa = OSSL_PARAM_BLD_to_param(bld.get());
+		pki_openssl_error();
+		EVP_PKEY_fromdata(ctx, &pk, EVP_PKEY_KEYPAIR, pa);
+		pki_openssl_error();
+		OSSL_PARAM_free(pa);
+		pki_openssl_error();
+	}
+
 	if (sl.size() > 2 && pk)
 		setComment(sl[2].section('\n', 0, 0));
 
@@ -693,6 +690,17 @@ void pki_key::ssh_key_QBA2data(const QByteArray &ba, QByteArray *data) const
 void pki_key::ssh_key_bn2data(const BIGNUM *bn, QByteArray *data) const
 {
 	ssh_key_QBA2data(BioByteArray(bn), data);
+}
+
+void pki_key::ssh_key_bn2dataParam(const EVP_PKEY *pkey, const char *param,
+				QByteArray *data) const
+{
+	BIGNUM *bn = nullptr;
+	if (EVP_PKEY_get_bn_param(pkey, param, &bn) > 0)
+		ssh_key_QBA2data(BioByteArray(bn), data);
+	if (bn)
+		BN_free(bn);
+	pki_openssl_error();
 }
 
 bool pki_key::SSH2_compatible() const
@@ -719,27 +727,16 @@ QByteArray pki_key::SSH2publicQByteArray(bool raw) const
 	case EVP_PKEY_RSA:
 		txt = "ssh-rsa";
 		ssh_key_QBA2data(txt, &data);
-		{
-			const RSA *rsa = EVP_PKEY_get0_RSA(key);
-			const BIGNUM *n, *e;
-			RSA_get0_key(rsa, &n, &e, NULL);
-			ssh_key_bn2data(e, &data);
-			ssh_key_bn2data(n, &data);
-		}
+		ssh_key_bn2dataParam(key, OSSL_PKEY_PARAM_RSA_E, &data);
+		ssh_key_bn2dataParam(key, OSSL_PKEY_PARAM_RSA_N, &data);
 		break;
 	case EVP_PKEY_DSA:
 		txt = "ssh-dss";
 		ssh_key_QBA2data(txt, &data);
-		{
-			const DSA *dsa = EVP_PKEY_get0_DSA(key);
-			const BIGNUM *p, *q, *g, *pubkey;
-			DSA_get0_pqg(dsa, &p, &q, &g);
-			DSA_get0_key(dsa, &pubkey, NULL);
-			ssh_key_bn2data(p, &data);
-			ssh_key_bn2data(q, &data);
-			ssh_key_bn2data(g, &data);
-			ssh_key_bn2data(pubkey, &data);
-		}
+		ssh_key_bn2dataParam(key, OSSL_PKEY_PARAM_FFC_P, &data);
+		ssh_key_bn2dataParam(key, OSSL_PKEY_PARAM_FFC_Q, &data);
+		ssh_key_bn2dataParam(key, OSSL_PKEY_PARAM_FFC_G, &data);
+		ssh_key_bn2dataParam(key, OSSL_PKEY_PARAM_PUB_KEY, &data);
 		break;
 #ifndef OPENSSL_NO_EC
 	case EVP_PKEY_EC:
@@ -749,12 +746,7 @@ QByteArray pki_key::SSH2publicQByteArray(bool raw) const
 		txt = "ecdsa-sha2-nistp256";
 		ssh_key_QBA2data(txt, &data);
 		ssh_key_QBA2data("nistp256", &data);
-		{
-			BIGNUM *bn = ecPubKeyBN();
-			ssh_key_bn2data(bn, &data);
-			BN_free(bn);
-		}
-		pki_openssl_error();
+		ssh_key_bn2dataParam(key, OSSL_PKEY_PARAM_PUB_KEY, &data);
 		break;
 #ifdef EVP_PKEY_ED25519
 	case EVP_PKEY_ED25519:

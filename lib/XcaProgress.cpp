@@ -48,13 +48,6 @@ void XcaProgress::increment()
 	progress->increment();
 }
 
-void XcaProgress::inc(int, int, void *p)
-{
-	XcaProgress *prog = static_cast<XcaProgress*>(p);
-	if (prog)
-		prog->increment();
-}
-
 void XcaProgress::setGui(XcaProgress_i *p)
 {
 	delete progress;
