@@ -192,6 +192,8 @@ class pki_key: public pki_base
 		void ssh_key_QBA2data(const QByteArray &ba,
 					QByteArray *data) const;
 		void ssh_key_bn2data(const BIGNUM *bn, QByteArray *data) const;
+		EVP_PKEY *fromParamData(QSharedPointer<OSSL_PARAM_BLD> bld,
+			const QMap<const char *, BIGNUM*> &params, int keytype) const;
 
 	private:
 		mutable int useCount; // usage counter
@@ -247,7 +249,8 @@ class pki_key: public pki_base
 						const char *param, int bits = 0) const;
 		void ssh_key_bn2dataParam(const EVP_PKEY *pkey, const char *param,
 						QByteArray *data) const;
-		QString BignumParam(const char *param_name) const;
+		QString BignumParamQString(const char *param_name) const;
+		BIGNUM *BignumParam(const char *param_name) const;
 
 #ifndef OPENSSL_NO_EC
 		int ecParamNid() const;

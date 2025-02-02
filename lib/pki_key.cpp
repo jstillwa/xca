@@ -371,15 +371,21 @@ QString pki_key::BN2QString(const BIGNUM *bn) const
 	return QString::fromLatin1(hex);
 }
 
-QString pki_key::BignumParam(const char *param_name) const
+QString pki_key::BignumParamQString(const char *param_name) const
 {
-	BIGNUM *bn = nullptr;
-	QString ret;
-	if (EVP_PKEY_get_bn_param(key, param_name, &bn) > 0)
-		ret = BN2QString(bn);
+	BIGNUM *bn = BignumParam(param_name);
+	QString ret = BN2QString(bn);
 	if(bn)
 		BN_free(bn);
 	return ret;
+}
+
+BIGNUM *pki_key::BignumParam(const char *param_name) const
+{
+	BIGNUM *bn = nullptr;
+	EVP_PKEY_get_bn_param(key, param_name, &bn);
+	pki_openssl_error();
+	return bn;
 }
 
 QVariant pki_key::column_data(const dbheader *hd) const
@@ -585,30 +591,35 @@ EVP_PKEY *pki_key::load_ssh2_key(const QByteArray &b)
 	} else {
 		throw errorEx(tr("Unexpected SSH2 content: '%1'").arg(sl[0]));
 	}
-	if (!pk) {
-		// Need to generate key from parameters
-		EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(keytype, nullptr);
-		Q_CHECK_PTR(ctx);
-		pki_openssl_error();
-		if (EVP_PKEY_fromdata_init(ctx) <= 0)
-			return nullptr;
-		for (auto i = params.cbegin(), end = params.cend(); i != end; ++i) {
-			OSSL_PARAM_BLD_push_BN(bld.get(), i.key(), i.value());
-			pki_openssl_error();
-			qDebug() << qPrintable(i.key()) << ": "
-					 << BioByteArray(i.value()).qstring();
-		}
-		OSSL_PARAM *pa = OSSL_PARAM_BLD_to_param(bld.get());
-		pki_openssl_error();
-		EVP_PKEY_fromdata(ctx, &pk, EVP_PKEY_KEYPAIR, pa);
-		pki_openssl_error();
-		OSSL_PARAM_free(pa);
-		pki_openssl_error();
-	}
+	if (!pk)
+		pk = fromParamData(bld, params, keytype);
 
 	if (sl.size() > 2 && pk)
 		setComment(sl[2].section('\n', 0, 0));
 
+	return pk;
+}
+
+EVP_PKEY *pki_key::fromParamData(QSharedPointer<OSSL_PARAM_BLD> bld,
+		const QMap<const char *, BIGNUM*> &params, int keytype) const
+{
+	EVP_PKEY *pk = nullptr;
+	EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(keytype, nullptr);
+	Q_CHECK_PTR(ctx);
+	pki_openssl_error();
+	if (EVP_PKEY_fromdata_init(ctx) <= 0)
+		return nullptr;
+	for (auto i = params.cbegin(), end = params.cend(); i != end; ++i) {
+		OSSL_PARAM_BLD_push_BN(bld.get(), i.key(), i.value());
+		qDebug() << qPrintable(i.key()) << ": "
+				<< BioByteArray(i.value()).qstring();
+	}
+	OSSL_PARAM *pa = OSSL_PARAM_BLD_to_param(bld.get());
+	EVP_PKEY_fromdata(ctx, &pk, EVP_PKEY_KEYPAIR, pa);
+	OSSL_PARAM_free(pa);
+	for (auto i = params.cbegin(), end = params.cend(); i != end; ++i)
+		BN_free(i.value());
+	pki_openssl_error();
 	return pk;
 }
 

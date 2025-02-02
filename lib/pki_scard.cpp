@@ -20,6 +20,12 @@
 
 #include <QThread>
 #include <QInputDialog>
+#include <QSharedPointer>
+
+#include <openssl/ec.h>
+#include <openssl/bn.h>
+#include <openssl/core_names.h>
+#include <openssl/param_build.h>
 
 void pki_scard::init(void)
 {
@@ -114,6 +120,20 @@ QSqlError pki_scard::deleteSqlData()
 	return q.lastError();
 }
 
+static BIGNUM *attribute2bignum(pkcs11 &p11, CK_OBJECT_HANDLE object, unsigned long attr)
+{
+	pk11_attr_data bn(attr);
+	p11.loadAttribute(bn, object);
+	return bn.getBignum();
+}
+
+static QByteArray attribute2bytearray(pkcs11 &p11, CK_OBJECT_HANDLE object, unsigned long attr)
+{
+	pk11_attr_data bn(attr);
+	p11.loadAttribute(bn, object);
+	return bn.getData();
+}
+
 EVP_PKEY *pki_scard::load_pubkey(pkcs11 &p11, CK_OBJECT_HANDLE object) const
 {
 	unsigned long keytype;
@@ -123,83 +143,38 @@ EVP_PKEY *pki_scard::load_pubkey(pkcs11 &p11, CK_OBJECT_HANDLE object) const
 	p11.loadAttribute(type, object);
 	keytype = type.getValue();
 
+	QMap<const char *, BIGNUM*> params;
+	QSharedPointer<OSSL_PARAM_BLD> bld(OSSL_PARAM_BLD_new(),
+				OSSL_PARAM_BLD_free);
+	Q_CHECK_PTR(bld.get());
+
 	switch (keytype) {
-	case CKK_RSA: {
-		RSA *rsa = RSA_new();
-
-		pk11_attr_data n(CKA_MODULUS);
-		p11.loadAttribute(n, object);
-
-		pk11_attr_data e(CKA_PUBLIC_EXPONENT);
-		p11.loadAttribute(e, object);
-
-		RSA_set0_key(rsa, n.getBignum(), e.getBignum(), NULL);
-
-		pkey = EVP_PKEY_new();
-		EVP_PKEY_assign_RSA(pkey, rsa);
+	case CKK_RSA:
+		params[OSSL_PKEY_PARAM_RSA_E] = attribute2bignum(p11, object, CKA_PUBLIC_EXPONENT);
+		params[OSSL_PKEY_PARAM_RSA_N] = attribute2bignum(p11, object, CKA_MODULUS);
 		break;
-	}
-	case CKK_DSA: {
-		DSA *dsa = DSA_new();
-
-		pk11_attr_data p(CKA_PRIME);
-		p11.loadAttribute(p, object);
-
-		pk11_attr_data q(CKA_SUBPRIME);
-		p11.loadAttribute(q, object);
-
-		pk11_attr_data g(CKA_BASE);
-		p11.loadAttribute(g, object);
-
-		pk11_attr_data pub(CKA_VALUE);
-		p11.loadAttribute(pub, object);
-
-		DSA_set0_pqg(dsa, p.getBignum(), q.getBignum(), g.getBignum());
-		DSA_set0_key(dsa, pub.getBignum(), NULL);
-
-		pkey = EVP_PKEY_new();
-		EVP_PKEY_assign_DSA(pkey, dsa);
+	case CKK_DSA:
+		params[OSSL_PKEY_PARAM_FFC_P] = attribute2bignum(p11, object, CKA_PRIME);
+		params[OSSL_PKEY_PARAM_FFC_Q] = attribute2bignum(p11, object, CKA_SUBPRIME);
+		params[OSSL_PKEY_PARAM_FFC_G] = attribute2bignum(p11, object, CKA_BASE);
+		params[OSSL_PKEY_PARAM_PUB_KEY] = attribute2bignum(p11, object, CKA_VALUE);
 		break;
-	}
 #ifndef OPENSSL_NO_EC
 	case CKK_EC: {
 		QByteArray ba;
-		EC_GROUP *group;
-		ASN1_OCTET_STRING *os;
 
-		EC_KEY *ec = EC_KEY_new();
-
-		pk11_attr_data grp(CKA_EC_PARAMS);
-		p11.loadAttribute(grp, object);
-		ba = grp.getData();
-		group = (EC_GROUP *)
+		ba = attribute2bytearray(p11, object, CKA_EC_PARAMS);
+		EC_GROUP *group = (EC_GROUP *)
 			d2i_bytearray(D2I_VOID(d2i_ECPKParameters), ba);
+		int nid = EC_GROUP_get_curve_name(group);
+		EC_GROUP_free(group);
 		pki_openssl_error();
+		OSSL_PARAM_BLD_push_utf8_string(bld.get(), OSSL_PKEY_PARAM_GROUP_NAME,
+			OBJ_nid2sn(nid), 0);
 
-		EC_GROUP_set_asn1_flag(group, 1);
-		EC_KEY_set_group(ec, group);
-		pki_openssl_error();
-
-		pk11_attr_data pt(CKA_EC_POINT);
-		p11.loadAttribute(pt, object);
-		ba = pt.getData();
-		os = (ASN1_OCTET_STRING *)
-			d2i_bytearray(D2I_VOID(d2i_ASN1_OCTET_STRING), ba);
-		pki_openssl_error();
-
-		BIGNUM *bn = BN_bin2bn(os->data, os->length, NULL);
-		pki_openssl_error();
-
-		EC_POINT *point = EC_POINT_bn2point(group, bn, NULL, NULL);
-		BN_free(bn);
-		ASN1_OCTET_STRING_free(os);
-		pki_openssl_error();
-
-		EC_KEY_set_public_key(ec, point);
-		pki_openssl_error();
-
-		pkey = EVP_PKEY_new();
-		EVP_PKEY_assign_EC_KEY(pkey, ec);
+		ba = attribute2bytearray(p11, object, CKA_EC_POINT);
+		OSSL_PARAM_BLD_push_octet_string(bld.get(), OSSL_PKEY_PARAM_PUB_KEY,
+			ba.data(), ba.size());
 		break;
 	}
 #ifdef EVP_PKEY_ED25519
@@ -227,8 +202,9 @@ EVP_PKEY *pki_scard::load_pubkey(pkcs11 &p11, CK_OBJECT_HANDLE object) const
 	default:
 		throw errorEx(QString("Unsupported CKA_KEY_TYPE: %1\n").arg(keytype));
 	}
-
 	pki_openssl_error();
+	if (pkey)
+		pkey = fromParamData(bld, params, keytype);
 	return pkey;
 }
 
@@ -304,42 +280,30 @@ void pki_scard::deleteFromToken()
 pk11_attlist pki_scard::objectAttributesNoId(EVP_PKEY *pk, bool priv) const
 {
 	QByteArray ba;
-	const RSA *rsa;
-	const DSA *dsa;
-#ifndef OPENSSL_NO_EC
-	const EC_KEY *ec;
-#endif
-	const BIGNUM *n = NULL;
-	const BIGNUM *e = NULL;
-	const BIGNUM *p = NULL;
-	const BIGNUM *q = NULL;
-	const BIGNUM *g = NULL;
+	EC_GROUP *group = nullptr;
 
 	pk11_attlist attrs(pk11_attr_ulong(CKA_CLASS,
 			priv ? CKO_PRIVATE_KEY : CKO_PUBLIC_KEY));
 
 	switch (EVP_PKEY_type(EVP_PKEY_id(pk))) {
 	case EVP_PKEY_RSA:
-		rsa = EVP_PKEY_get0_RSA(pk);
-		RSA_get0_key(rsa, &n, &e, NULL);
 		attrs << pk11_attr_ulong(CKA_KEY_TYPE, CKK_RSA) <<
-			pk11_attr_data(CKA_MODULUS, n) <<
-			pk11_attr_data(CKA_PUBLIC_EXPONENT, e);
+			pk11_attr_data(CKA_MODULUS, BignumParam(OSSL_PKEY_PARAM_RSA_N)) <<
+			pk11_attr_data(CKA_PUBLIC_EXPONENT, BignumParam(OSSL_PKEY_PARAM_RSA_E));
 		break;
 	case EVP_PKEY_DSA:
-		dsa = EVP_PKEY_get0_DSA(pk);
-		DSA_get0_pqg(dsa, &p, &q, &g);
 		attrs << pk11_attr_ulong(CKA_KEY_TYPE, CKK_DSA) <<
-			pk11_attr_data(CKA_PRIME, p) <<
-			pk11_attr_data(CKA_SUBPRIME, q) <<
-			pk11_attr_data(CKA_BASE, g);
+			pk11_attr_data(CKA_PRIME, BignumParam(OSSL_PKEY_PARAM_FFC_P)) <<
+			pk11_attr_data(CKA_SUBPRIME, BignumParam(OSSL_PKEY_PARAM_FFC_Q)) <<
+			pk11_attr_data(CKA_BASE, BignumParam(OSSL_PKEY_PARAM_FFC_G));
 		break;
 #ifndef OPENSSL_NO_EC
 	case EVP_PKEY_EC:
-		ec = EVP_PKEY_get0_EC_KEY(pk);
-		ba = i2d_bytearray(I2D_VOID(i2d_ECPKParameters),
-				EC_KEY_get0_group(ec));
-
+		group = EC_GROUP_new_by_curve_name(ecParamNid());
+		if (group) {
+			ba = i2d_bytearray(I2D_VOID(i2d_ECPKParameters), group);
+			EC_GROUP_free(group);
+		}
 		attrs << pk11_attr_ulong(CKA_KEY_TYPE, CKK_EC) <<
 			pk11_attr_data(CKA_EC_PARAMS, ba);
 		break;
@@ -418,22 +382,9 @@ int pki_scard::renameOnToken(const slotid &slot, const QString &name)
 void pki_scard::store_token(const slotid &slot, EVP_PKEY *pkey)
 {
 	QByteArray ba;
-	const RSA *rsa;
-	const DSA *dsa;
-#ifndef OPENSSL_NO_EC
-	const EC_KEY *ec;
-#endif
 	pk11_attlist pub_atts;
 	pk11_attlist priv_atts;
 	QList<CK_OBJECT_HANDLE> objects;
-	const BIGNUM *d = NULL;
-	const BIGNUM *p = NULL;
-	const BIGNUM *q = NULL;
-	const BIGNUM *dmp1 = NULL;
-	const BIGNUM *dmq1 = NULL;
-	const BIGNUM *iqmp = NULL;
-	const BIGNUM *priv_key = NULL;
-	const BIGNUM *pub_key = NULL;
 
 	pub_atts = objectAttributesNoId(pkey, false);
 	priv_atts = objectAttributesNoId(pkey, true);
@@ -469,56 +420,31 @@ void pki_scard::store_token(const slotid &slot, EVP_PKEY *pkey)
 
 	switch (EVP_PKEY_type(EVP_PKEY_id(pkey))) {
 	case EVP_PKEY_RSA:
-		rsa = EVP_PKEY_get0_RSA(pkey);
-		RSA_get0_key(rsa, NULL, NULL, &d);
-		RSA_get0_factors(rsa, &p, &q);
-		RSA_get0_crt_params(rsa, &dmp1, &dmq1, &iqmp);
-
 		priv_atts <<
-		pk11_attr_data(CKA_PRIVATE_EXPONENT, d) <<
-		pk11_attr_data(CKA_PRIME_1, p) <<
-		pk11_attr_data(CKA_PRIME_2, q) <<
-		pk11_attr_data(CKA_EXPONENT_1, dmp1) <<
-		pk11_attr_data(CKA_EXPONENT_2, dmq1) <<
-		pk11_attr_data(CKA_COEFFICIENT, iqmp);
+		pk11_attr_data(CKA_PRIVATE_EXPONENT, BignumParam(OSSL_PKEY_PARAM_RSA_D)) <<
+		pk11_attr_data(CKA_PRIME_1, BignumParam(OSSL_PKEY_PARAM_RSA_FACTOR1)) <<
+		pk11_attr_data(CKA_PRIME_2, BignumParam(OSSL_PKEY_PARAM_RSA_FACTOR2)) <<
+		pk11_attr_data(CKA_EXPONENT_1, BignumParam(OSSL_PKEY_PARAM_RSA_EXPONENT1)) <<
+		pk11_attr_data(CKA_EXPONENT_2, BignumParam(OSSL_PKEY_PARAM_RSA_EXPONENT2)) <<
+		pk11_attr_data(CKA_COEFFICIENT, BignumParam(OSSL_PKEY_PARAM_RSA_COEFFICIENT1));
 		break;
 	case EVP_PKEY_DSA:
-		dsa = EVP_PKEY_get0_DSA(pkey);
-		DSA_get0_key(dsa, &pub_key, &priv_key);
-
-		priv_atts << pk11_attr_data(CKA_VALUE, priv_key);
-		pub_atts << pk11_attr_data(CKA_VALUE, pub_key);
+		priv_atts << pk11_attr_data(CKA_VALUE, BignumParam(OSSL_PKEY_PARAM_PRIV_KEY));
+		pub_atts << pk11_attr_data(CKA_VALUE, BignumParam(OSSL_PKEY_PARAM_PUB_KEY));
 		break;
 #ifndef OPENSSL_NO_EC
 	case EVP_PKEY_EC: {
 		/* Public Key */
-		BIGNUM *point;
-		int size;
-		unsigned char *buf;
-		ASN1_OCTET_STRING *os;
-
-		ec = EVP_PKEY_get0_EC_KEY(pkey);
-		point = EC_POINT_point2bn(EC_KEY_get0_group(ec),
-			EC_KEY_get0_public_key(ec),
-			EC_KEY_get_conv_form(ec), NULL, NULL);
-
-		pki_openssl_error();
-		size = BN_num_bytes(point);
-		buf = (unsigned char *)OPENSSL_malloc(size);
-		Q_CHECK_PTR(buf);
-		BN_bn2bin(point, buf);
-		os = ASN1_OCTET_STRING_new();
-		/* set0 -> ASN1_OCTET_STRING_free() also free()s buf */
-		ASN1_STRING_set0(os, buf, size);
+		QByteArray ba = QByteArrayParam(OSSL_PKEY_PARAM_EC_GENERATOR);
+		ASN1_OCTET_STRING *os = ASN1_OCTET_STRING_new();
+		ASN1_STRING_set(os, ba.data(), ba.size());
 		ba = i2d_bytearray(I2D_VOID(i2d_ASN1_OCTET_STRING), os);
 		ASN1_OCTET_STRING_free(os);
-		BN_free(point);
 		pki_openssl_error();
 		pub_atts << pk11_attr_data(CKA_EC_POINT, ba);
 
 		/* Private key */
-		priv_atts << pk11_attr_data(CKA_VALUE,
-					EC_KEY_get0_private_key(ec));
+		priv_atts << pk11_attr_data(CKA_VALUE, BignumParam(OSSL_PKEY_PARAM_PRIV_KEY));
 		break;
 	}
 #endif
@@ -614,7 +540,7 @@ bool pki_scard::find_key_on_card(slotid *slot) const
 
 		foreach(CK_OBJECT_HANDLE object, p11sess.objectList(cls)) {
 			EVP_PKEY *pkey = load_pubkey(p11sess, object);
-			bool match = EVP_PKEY_cmp(key, pkey) == 1;
+			bool match = EVP_PKEY_eq(key, pkey) == 1;
 			EVP_PKEY_free(pkey);
 
 			if (match) {
