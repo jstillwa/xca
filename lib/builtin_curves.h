@@ -13,9 +13,11 @@
 
 #include "base.h"
 
-#define CURVE_X962  1
-#define CURVE_OTHER 2
-#define CURVE_RFC5480 3
+#define CURVE_RFC5480 0
+#define CURVE_BRAINPOOL 1
+#define CURVE_X962  2
+#define CURVE_OTHER 3
+#define CURVE_MAX 4
 
 class builtin_curve
 {
@@ -23,12 +25,13 @@ class builtin_curve
 	int nid{};
 	QString comment{};
 	unsigned order_size{};
-	int flags{};
+	/* CURVE_xxxx */
+	int sortgroup{};
 	/* type: CKF_EC_F_P || CKF_EC_F_2M */
 	unsigned long type{};
 
-	builtin_curve(int n, QString c, int s, int f, int t)
-		: nid(n), comment(c), order_size(s), flags(f), type(t) { };
+	builtin_curve(int n, const QString &c, int s, int g, int t)
+		: nid(n), comment(c), order_size(s), sortgroup(g), type(t) { };
 	builtin_curve() = delete;
 };
 

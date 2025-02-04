@@ -151,7 +151,7 @@ void NewKey::addCurveBoxCurves(const QList<builtin_curve> &curves)
 void NewKey::updateCurves(unsigned min, unsigned max, unsigned long ec_flags)
 {
 #ifndef OPENSSL_NO_EC
-	QList<builtin_curve> curve_rfc5480, curve_x962, curve_other;
+	QList<builtin_curve> curves[CURVE_MAX];
 
 	foreach(builtin_curve curve, builtinCurves) {
 		const char *sn = OBJ_nid2sn(curve.nid);
@@ -160,18 +160,14 @@ void NewKey::updateCurves(unsigned min, unsigned max, unsigned long ec_flags)
 			continue;
 		if (ec_flags && (curve.type & ec_flags) == 0)
 			continue;
-		switch (curve.flags) {
-			case CURVE_RFC5480: curve_rfc5480  << curve; break;
-			case CURVE_X962:    curve_x962     << curve; break;
-			case CURVE_OTHER:   curve_other    << curve; break;
-		}
+		curves[curve.sortgroup] << curve;
 	}
 	curveBox->clear();
-	addCurveBoxCurves(curve_rfc5480);
-	curveBox->insertSeparator(curveBox->count());
-	addCurveBoxCurves(curve_x962);
-	curveBox->insertSeparator(curveBox->count());
-	addCurveBoxCurves(curve_other);
+	for (int i = 0; i<CURVE_MAX; i++) {
+		addCurveBoxCurves(curves[i]);
+		if (!curves[i].isEmpty() && i < CURVE_MAX-1)
+			curveBox->insertSeparator(curveBox->count());
+	}
 
 	int default_index = curveBox->findData(
 				QVariant(keyjob::defaultjob.ec_nid));

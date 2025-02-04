@@ -5,7 +5,7 @@
  */
 #include <openssl/evp.h>
 #include <QDebug>
-#include <QList>
+#include <QMap>
 
 #include "builtin_curves.h"
 #include "exception.h"
@@ -15,112 +15,96 @@
 #include <openssl/ec.h>
 #include "opensc-pkcs11.h"
 
-static const QList<int> rfc5480_curve_nids()
+static int curve_class(int nid)
 {
-	return QList<int> {
-	NID_X9_62_prime192v1,
-	NID_secp224r1,
-	NID_X9_62_prime256v1,
-	NID_secp384r1,
-	NID_secp521r1,
+	static const QMap<int, int> map {
+	{ NID_X9_62_prime192v1, CURVE_RFC5480 },
+	{ NID_X9_62_prime256v1, CURVE_RFC5480 },
+	{ NID_secp224r1, CURVE_RFC5480 },
+	{ NID_secp384r1, CURVE_RFC5480 },
+	{ NID_secp521r1, CURVE_RFC5480 },
+
+	{ NID_X9_62_prime192v2, CURVE_X962 },
+	{ NID_X9_62_prime192v3, CURVE_X962 },
+	{ NID_X9_62_prime239v1, CURVE_X962 },
+	{ NID_X9_62_prime239v2, CURVE_X962 },
+	{ NID_X9_62_prime239v3, CURVE_X962 },
+
+	{ NID_X9_62_c2pnb163v1, CURVE_X962 },
+	{ NID_X9_62_c2pnb163v2, CURVE_X962 },
+	{ NID_X9_62_c2pnb163v3, CURVE_X962 },
+	{ NID_X9_62_c2pnb176v1, CURVE_X962 },
+	{ NID_X9_62_c2tnb191v1, CURVE_X962 },
+	{ NID_X9_62_c2tnb191v2, CURVE_X962 },
+	{ NID_X9_62_c2tnb191v3, CURVE_X962 },
+	{ NID_X9_62_c2pnb208w1, CURVE_X962 },
+	{ NID_X9_62_c2tnb239v1, CURVE_X962 },
+	{ NID_X9_62_c2tnb239v2, CURVE_X962 },
+	{ NID_X9_62_c2tnb239v3, CURVE_X962 },
+	{ NID_X9_62_c2pnb272w1, CURVE_X962 },
+	{ NID_X9_62_c2pnb304w1, CURVE_X962 },
+	{ NID_X9_62_c2tnb359v1, CURVE_X962 },
+	{ NID_X9_62_c2pnb368w1, CURVE_X962 },
+	{ NID_X9_62_c2tnb431r1, CURVE_X962 },
+
+	{ NID_sect113r1, CURVE_OTHER },
+	{ NID_sect113r2, CURVE_OTHER },
+	{ NID_sect131r1, CURVE_OTHER },
+	{ NID_sect131r2, CURVE_OTHER },
+	{ NID_sect163k1, CURVE_OTHER },
+	{ NID_sect163r1, CURVE_OTHER },
+	{ NID_sect163r2, CURVE_OTHER },
+	{ NID_sect193r1, CURVE_OTHER },
+	{ NID_sect193r2, CURVE_OTHER },
+	{ NID_sect233k1, CURVE_OTHER },
+	{ NID_sect233r1, CURVE_OTHER },
+	{ NID_sect239k1, CURVE_OTHER },
+	{ NID_sect283k1, CURVE_OTHER },
+	{ NID_sect283r1, CURVE_OTHER },
+	{ NID_sect409k1, CURVE_OTHER },
+	{ NID_sect409r1, CURVE_OTHER },
+	{ NID_sect571k1, CURVE_OTHER },
+	{ NID_sect571r1, CURVE_OTHER },
+
+	{ NID_secp112r1, CURVE_OTHER },
+	{ NID_secp112r2, CURVE_OTHER },
+	{ NID_secp128r1, CURVE_OTHER },
+	{ NID_secp128r2, CURVE_OTHER },
+	{ NID_secp160k1, CURVE_OTHER },
+	{ NID_secp160r1, CURVE_OTHER },
+	{ NID_secp160r2, CURVE_OTHER },
+	{ NID_secp192k1, CURVE_OTHER },
+	{ NID_secp224k1, CURVE_OTHER },
+	{ NID_secp256k1, CURVE_OTHER },
+
+	{ NID_wap_wsg_idm_ecid_wtls1, CURVE_OTHER },
+	{ NID_wap_wsg_idm_ecid_wtls3, CURVE_OTHER },
+	{ NID_wap_wsg_idm_ecid_wtls4, CURVE_OTHER },
+	{ NID_wap_wsg_idm_ecid_wtls5, CURVE_OTHER },
+	{ NID_wap_wsg_idm_ecid_wtls6, CURVE_OTHER },
+	{ NID_wap_wsg_idm_ecid_wtls7, CURVE_OTHER },
+	{ NID_wap_wsg_idm_ecid_wtls8, CURVE_OTHER },
+	{ NID_wap_wsg_idm_ecid_wtls9, CURVE_OTHER },
+	{ NID_wap_wsg_idm_ecid_wtls10, CURVE_OTHER },
+	{ NID_wap_wsg_idm_ecid_wtls11, CURVE_OTHER },
+	{ NID_wap_wsg_idm_ecid_wtls12, CURVE_OTHER },
+
+	{ NID_brainpoolP160r1, CURVE_BRAINPOOL },
+	{ NID_brainpoolP160t1, CURVE_BRAINPOOL },
+	{ NID_brainpoolP192r1, CURVE_BRAINPOOL },
+	{ NID_brainpoolP192t1, CURVE_BRAINPOOL },
+	{ NID_brainpoolP224r1, CURVE_BRAINPOOL },
+	{ NID_brainpoolP224t1, CURVE_BRAINPOOL },
+	{ NID_brainpoolP256r1, CURVE_BRAINPOOL },
+	{ NID_brainpoolP256t1, CURVE_BRAINPOOL },
+	{ NID_brainpoolP320r1, CURVE_BRAINPOOL },
+	{ NID_brainpoolP320t1, CURVE_BRAINPOOL },
+	{ NID_brainpoolP384r1, CURVE_BRAINPOOL },
+	{ NID_brainpoolP384t1, CURVE_BRAINPOOL },
+	{ NID_brainpoolP512r1, CURVE_BRAINPOOL },
+	{ NID_brainpoolP512t1, CURVE_BRAINPOOL },
 	};
-};
-
-static const QList<int> x962_curve_nids()
-{
-	return QList<int> {
-	NID_X9_62_prime192v1,
-	NID_X9_62_prime192v2,
-	NID_X9_62_prime192v3,
-	NID_X9_62_prime239v1,
-	NID_X9_62_prime239v2,
-	NID_X9_62_prime239v3,
-	NID_X9_62_prime256v1,
-
-	NID_X9_62_c2pnb163v1,
-	NID_X9_62_c2pnb163v2,
-	NID_X9_62_c2pnb163v3,
-	NID_X9_62_c2pnb176v1,
-	NID_X9_62_c2tnb191v1,
-	NID_X9_62_c2tnb191v2,
-	NID_X9_62_c2tnb191v3,
-	NID_X9_62_c2pnb208w1,
-	NID_X9_62_c2tnb239v1,
-	NID_X9_62_c2tnb239v2,
-	NID_X9_62_c2tnb239v3,
-	NID_X9_62_c2pnb272w1,
-	NID_X9_62_c2pnb304w1,
-	NID_X9_62_c2tnb359v1,
-	NID_X9_62_c2pnb368w1,
-	NID_X9_62_c2tnb431r1
-	};
-};
-
-static const QList<int> other_curve_nids()
-{
-	return QList<int> {
-	NID_sect113r1,
-	NID_sect113r2,
-	NID_sect131r1,
-	NID_sect131r2,
-	NID_sect163k1,
-	NID_sect163r1,
-	NID_sect163r2,
-	NID_sect193r1,
-	NID_sect193r2,
-	NID_sect233k1,
-	NID_sect233r1,
-	NID_sect239k1,
-	NID_sect283k1,
-	NID_sect283r1,
-	NID_sect409k1,
-	NID_sect409r1,
-	NID_sect571k1,
-	NID_sect571r1,
-
-	NID_secp112r1,
-	NID_secp112r2,
-	NID_secp128r1,
-	NID_secp128r2,
-	NID_secp160k1,
-	NID_secp160r1,
-	NID_secp160r2,
-	NID_secp192k1,
-	NID_secp224k1,
-	NID_secp224r1,
-	NID_secp256k1,
-	NID_secp384r1,
-	NID_secp521r1,
-
-	NID_wap_wsg_idm_ecid_wtls1,
-	NID_wap_wsg_idm_ecid_wtls3,
-	NID_wap_wsg_idm_ecid_wtls4,
-	NID_wap_wsg_idm_ecid_wtls5,
-	NID_wap_wsg_idm_ecid_wtls6,
-	NID_wap_wsg_idm_ecid_wtls7,
-	NID_wap_wsg_idm_ecid_wtls8,
-	NID_wap_wsg_idm_ecid_wtls9,
-	NID_wap_wsg_idm_ecid_wtls10,
-	NID_wap_wsg_idm_ecid_wtls11,
-	NID_wap_wsg_idm_ecid_wtls12,
-
-#ifdef NID_brainpoolP160r1
-	NID_brainpoolP160r1,
-	NID_brainpoolP160t1,
-	NID_brainpoolP192r1,
-	NID_brainpoolP192t1,
-	NID_brainpoolP224r1,
-	NID_brainpoolP224t1,
-	NID_brainpoolP256r1,
-	NID_brainpoolP256t1,
-	NID_brainpoolP320r1,
-	NID_brainpoolP320t1,
-	NID_brainpoolP384r1,
-	NID_brainpoolP384t1,
-	NID_brainpoolP512r1,
-	NID_brainpoolP512t1
-#endif
-	};
+	return map.value(nid, -1);
 };
 
 builtin_curves::builtin_curves()
@@ -130,28 +114,19 @@ builtin_curves::builtin_curves()
 
 	Q_CHECK_PTR(curves);
 
-	BIGNUM *order = BN_new();
-	Q_CHECK_PTR(order);
-
 	EC_get_builtin_curves(curves, num_curves);
 
 	for (i=0; i < num_curves; i++) {
-		int flag = 0, nid = curves[i].nid;
+		int sortgroup, nid = curves[i].nid;
 		unsigned long type = 0;
 
-		if (rfc5480_curve_nids().contains(nid))
-			flag = CURVE_RFC5480;
-		else if (x962_curve_nids().contains(nid))
-			flag = CURVE_X962;
-		else if (other_curve_nids().contains(nid))
-			flag = CURVE_OTHER;
-		else
+		if ((sortgroup = curve_class(nid)) == -1)
 			continue;
 
 		EC_GROUP *group = EC_GROUP_new_by_curve_name(nid);
-		EC_GROUP_get_order(group, order, NULL);
+		const BIGNUM *order = EC_GROUP_get0_order(group);
 
-		switch (EC_METHOD_get_field_type(EC_GROUP_method_of(group))) {
+		switch (EC_GROUP_get_field_type(group)) {
 		case NID_X9_62_prime_field:
 			type = CKF_EC_F_P;
 			break;
@@ -166,13 +141,13 @@ builtin_curves::builtin_curves()
 		qDebug() << QString(curves[i].comment).leftJustified(50)
 			<< QString(OBJ_nid2sn(nid)).leftJustified(27)
 			<< OBJ_obj2QString(OBJ_nid2obj(nid),1).leftJustified(20)
-			<< (type == CKF_EC_F_P ? "Fp" : "F2m");
+			<< (type == CKF_EC_F_P ? "Fp " : "F2m") << type
+			<< nid << sortgroup << EC_GROUP_get_field_type(group);
 #endif
 		append(builtin_curve(nid, QString(curves[i].comment),
-			BN_num_bits(order), flag, type));
-                EC_GROUP_free(group);
+			BN_num_bits(order), sortgroup, type));
+		EC_GROUP_free(group);
 	}
-	BN_free(order);
 	delete[] curves;
 }
 #else
