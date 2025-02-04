@@ -180,7 +180,6 @@ class pki_key: public pki_base
 		int key_size;
 		bool isPub;
 		EVP_PKEY *key;
-		QString BN2QString(const BIGNUM *bn) const;
 		QByteArray SSH2publicQByteArray(bool raw=false) const;
 		QByteArray X509_PUBKEY_public_key() const;
 		QByteArray PEM_comment() const;

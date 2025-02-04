@@ -362,19 +362,10 @@ void pki_key::writePublic(XFile &file, bool pem) const
 	file.write(b);
 }
 
-QString pki_key::BN2QString(const BIGNUM *bn) const
-{
-	QByteArray hex, ba = BioByteArray(bn);
-	for(int i = 0; i<ba.size(); i += 16)
-		hex += ba.mid(i, 16).toHex(':') + '\n';
-	hex.chop(1);
-	return QString::fromLatin1(hex);
-}
-
 QString pki_key::BignumParamQString(const char *param_name) const
 {
 	BIGNUM *bn = BignumParam(param_name);
-	QString ret = BN2QString(bn);
+	QString ret = toHexBlock(BioByteArray(bn));
 	if(bn)
 		BN_free(bn);
 	return ret;

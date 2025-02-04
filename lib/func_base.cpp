@@ -291,3 +291,12 @@ QString appendXcaComment(QString current, QString msg)
 		current += "\n";
 	return current + QString("(%1)\n").arg(msg);
 }
+
+QString toHexBlock(const QByteArray &ba)
+{
+	QByteArray hex;
+	for(int i = 0; i < ba.size(); i += 16)
+		hex += ba.mid(i, 16).toHex(':') + '\n';
+	hex.chop(1);
+	return QString::fromLatin1(hex);
+}

@@ -60,6 +60,7 @@ void *d2i_bytearray(void *(*d2i)(void*, unsigned char**, long),
 QString appendXcaComment(QString current, QString msg);
 
 QString get_ossl_verify_error(int err);
+QString toHexBlock(const QByteArray &ba);
 
 /* from version.cpp */
 const char *version_str(bool html);

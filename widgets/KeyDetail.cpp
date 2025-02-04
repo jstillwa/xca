@@ -128,7 +128,7 @@ void KeyDetail::setKey(pki_key *key, bool import)
 				MainWindow::getResolver(),
 				SLOT(searchOid(QString)));
 			keyPubEx->setToolTip(CurveComment(nid));
-			keyModulus->setText(key->BignumParamQString(OSSL_PKEY_PARAM_PUB_KEY));
+			keyModulus->setText(toHexBlock(key->QByteArrayParam(OSSL_PKEY_PARAM_PUB_KEY)));
 			break;
 #ifdef EVP_PKEY_ED25519
 		case EVP_PKEY_ED25519:
@@ -136,7 +136,7 @@ void KeyDetail::setKey(pki_key *key, bool import)
 			tlPrivEx->setText(tr("Private key"));
 			tlPubEx->setText(tr("Curve name"));
 			keyPubEx->setText("ed25519");
-			keyModulus->setText(key->ed25519PubKey().toHex());
+			keyModulus->setText(toHexBlock(key->ed25519PubKey()));
 			break;
 #endif
 #endif
