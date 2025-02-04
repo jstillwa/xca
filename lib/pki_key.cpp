@@ -375,8 +375,21 @@ BIGNUM *pki_key::BignumParam(const char *param_name) const
 {
 	BIGNUM *bn = nullptr;
 	EVP_PKEY_get_bn_param(key, param_name, &bn);
+	if (pki_ign_openssl_error())
+		qWarning() << QString("BignumParam %1 failed").arg(param_name);
 	pki_openssl_error();
 	return bn;
+}
+
+QByteArray pki_key::QByteArrayParam(const char *param) const
+{
+		QByteArray ba;
+		size_t buflen = 0;
+		EVP_PKEY_get_octet_string_param(key, param, nullptr, 0, &buflen);
+		ba.resize(buflen);
+		EVP_PKEY_get_octet_string_param(key, param,
+			(unsigned char*)ba.data(), ba.size(), nullptr);
+		return ba;
 }
 
 QVariant pki_key::column_data(const dbheader *hd) const
@@ -686,7 +699,7 @@ QByteArray pki_key::SSH2publicQByteArray(bool raw) const
 		txt = "ecdsa-sha2-nistp256";
 		ssh_key_QBA2data(txt, &data);
 		ssh_key_QBA2data("nistp256", &data);
-		ssh_key_bn2dataParam(key, OSSL_PKEY_PARAM_PUB_KEY, &data);
+		ssh_key_QBA2data(QByteArrayParam(OSSL_PKEY_PARAM_PUB_KEY), &data);
 		break;
 #ifdef EVP_PKEY_ED25519
 	case EVP_PKEY_ED25519:
@@ -719,7 +732,7 @@ void pki_key::writeSSH2public(XFile &file) const
 bool pki_key::verify(EVP_PKEY *pkey) const
 {
 #ifndef LIBRESSL_VERSION_NUMBER
-	EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, NULL);
+	EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_from_pkey(nullptr, pkey, nullptr);
 	Q_CHECK_PTR(ctx);
 	int verify = EVP_PKEY_public_check(ctx);
 	EVP_PKEY_CTX_free(ctx);

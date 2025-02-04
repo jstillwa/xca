@@ -250,6 +250,7 @@ class pki_key: public pki_base
 						QByteArray *data) const;
 		QString BignumParamQString(const char *param_name) const;
 		BIGNUM *BignumParam(const char *param_name) const;
+		QByteArray QByteArrayParam(const char *param) const;
 
 #ifndef OPENSSL_NO_EC
 		int ecParamNid() const;
