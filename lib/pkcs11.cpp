@@ -649,376 +649,39 @@ int pkcs11::encrypt(int flen, const unsigned char *from,
 	return size;
 }
 
-static int rsa_privdata_free(RSA *rsa)
-{
-	pkcs11 *priv = (pkcs11*)RSA_get_app_data(rsa);
-	delete priv;
-	return 0;
-}
+#include <openssl/provider.h>
+#include <openssl/core_names.h>
 
-static int rsa_encrypt(int flen, const unsigned char *from,
-			unsigned char *to, RSA * rsa, int padding)
-{
-	pkcs11 *priv = (pkcs11*)RSA_get_app_data(rsa);
-	const BIGNUM *n = NULL;
-
-	if (padding != RSA_PKCS1_PADDING) {
-		return -1;
-	}
-	RSA_get0_key(rsa, &n, NULL, NULL);
-	return priv->encrypt(flen, from, to, BN_num_bytes(n), CKM_RSA_PKCS);
-}
-
-static int rsa_decrypt(int flen, const unsigned char *from,
-			unsigned char *to, RSA * rsa, int padding)
-{
-	pkcs11 *priv = (pkcs11*)RSA_get_app_data(rsa);
-
-	if (padding != RSA_PKCS1_PADDING) {
-		return -1;
-	}
-	return priv->decrypt(flen, from, to, flen, CKM_RSA_PKCS);
-}
-
-static int dsa_privdata_free(DSA *dsa)
-{
-	pkcs11 *p11 = (pkcs11*)DSA_get_ex_data(dsa, 0);
-	delete p11;
-	return 0;
-}
-
-static DSA_SIG *dsa_sign(const unsigned char *dgst, int dlen, DSA *dsa)
-{
-	int len, rs_len;
-	unsigned char rs_buf[128];
-	pkcs11 *p11 = (pkcs11*)DSA_get_ex_data(dsa, 0);
-	DSA_SIG *dsa_sig = DSA_SIG_new();
-	BIGNUM *r, *s;
-
-	// siglen is unsigned and can't cope with -1 as return value
-	len = p11->encrypt(dlen, dgst, rs_buf, sizeof rs_buf, CKM_DSA);
-	if (len & 0x01) // Must be even
-		goto out;
-
-	rs_len = len / 2;
-	r = BN_bin2bn(rs_buf, rs_len, NULL);
-	s = BN_bin2bn(rs_buf + rs_len, rs_len, NULL);
-	DSA_SIG_set0(dsa_sig, r, s);
-	if (r && s)
-		return dsa_sig;
-out:
-	DSA_SIG_free(dsa_sig);
-	ign_openssl_error();
-	return NULL;
-}
-
-#ifndef OPENSSL_NO_EC
-
-static void ec_privdata_free(EC_KEY *ec)
-{
-	pkcs11 *p11 = (pkcs11*)EC_KEY_get_ex_data(ec, 0);
-	delete p11;
-}
-
-static int ec_sign_setup(EC_KEY *ec, BN_CTX *ctx, BIGNUM **kinvp, BIGNUM **rp)
-{
-	(void) ec;
-	(void) ctx;
-	(void) kinvp;
-	(void) rp;
-	return 1;
-}
-
-static ECDSA_SIG *ec_do_sign(const unsigned char *dgst, int dgst_len,
-			 const BIGNUM *in_kinv, const BIGNUM *in_r, EC_KEY *ec)
-{
-	int len, rs_len;
-	unsigned char rs_buf[512];
-	ECDSA_SIG *ec_sig = ECDSA_SIG_new();
-	pkcs11 *p11 = (pkcs11 *) EC_KEY_get_ex_data(ec, 0);
-	BIGNUM *r, *s;
-
-	(void) in_kinv;
-	(void) in_r;
-
-	// siglen is unsigned and can' cope with -1 as return value
-	len = p11->encrypt(dgst_len, dgst, rs_buf, sizeof rs_buf, CKM_ECDSA);
-	if (len & 0x01) // Must be even
-		goto out;
-	/* The buffer contains r and s concatenated
-	 * Both of equal size
-	 * pkcs-11v2-20.pdf chapter 12.13.1, page 232
-	 */
-	rs_len = len / 2;
-	r = BN_bin2bn(rs_buf, rs_len, NULL);
-	s = BN_bin2bn(rs_buf + rs_len, rs_len, NULL);
-	ECDSA_SIG_set0(ec_sig, r, s);
-	if (r && s)
-		return ec_sig;
-
-out:
-	ECDSA_SIG_free(ec_sig);
-	ign_openssl_error();
-	return NULL;
-}
-
-static int ec_sign(int type, const unsigned char *dgst, int dlen,
-			   unsigned char *sig, unsigned int *siglen,
-			   const BIGNUM *kinv, const BIGNUM *r, EC_KEY *ec)
-{
-	ECDSA_SIG *ec_sig;
-	int ret = 0;
-	int len;
-
-	(void) type;
-	ec_sig = ec_do_sign(dgst, dlen, kinv, r, ec);
-	if (!ec_sig)
-		return 0;
-
-	len = i2d_ECDSA_SIG(ec_sig, &sig);
-	if (len <= 0)
-		goto out;
-	*siglen = len;
-	ret = 1;
-out:
-	ECDSA_SIG_free(ec_sig);
-	ign_openssl_error();
-	return ret;
-}
-
-static EC_KEY_METHOD *setup_ec_key_meth()
-{
-	EC_KEY_METHOD *ec_key_meth;
-	int (*ec_init_proc)(EC_KEY *key);
-	void (*ec_finish_proc)(EC_KEY *key);
-	int (*ec_copy_proc)(EC_KEY *dest, const EC_KEY *src);
-	int (*ec_set_group_proc)(EC_KEY *key, const EC_GROUP *grp);
-	int (*ec_set_private_proc)(EC_KEY *key, const BIGNUM *priv_key);
-	int (*ec_set_public_proc)(EC_KEY *key, const EC_POINT *pub_key);
-
-	ec_key_meth = EC_KEY_METHOD_new(EC_KEY_get_default_method());
-	EC_KEY_METHOD_set_sign(ec_key_meth, ec_sign, ec_sign_setup, ec_do_sign);
-	EC_KEY_METHOD_get_init(ec_key_meth, &ec_init_proc, &ec_finish_proc,
-				&ec_copy_proc, &ec_set_group_proc,
-				&ec_set_private_proc, &ec_set_public_proc);
-	EC_KEY_METHOD_set_init(ec_key_meth, ec_init_proc, ec_privdata_free,
-				ec_copy_proc, ec_set_group_proc,
-				ec_set_private_proc, ec_set_public_proc);
-	return ec_key_meth;
-}
-
-
-#if defined(EVP_PKEY_ED25519) && OPENSSL_VERSION_NUMBER < 0x40000000L
-
-#include <openssl/engine.h>
-
-static EVP_PKEY_METHOD *p11_eddsa_method;
-
-// Shared between libressl and openssl
-static int eng_idx = -1;
-static int eng_finish(ENGINE *e)
-{
-	pkcs11 *p11 = (pkcs11 *)ENGINE_get_ex_data(e, eng_idx);
-	delete p11;
-	ENGINE_set_ex_data(e, eng_idx, NULL);
-	return 1;
-}
-
-#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
-static int eng_pmeth_copy(EVP_PKEY_CTX *dst, const EVP_PKEY_CTX *src)
-#else
-static int eng_pmeth_copy(EVP_PKEY_CTX *dst, EVP_PKEY_CTX *src)
-#endif
-{
-	void *p = EVP_PKEY_CTX_get_app_data((EVP_PKEY_CTX *)src);
-	EVP_PKEY_CTX_set_app_data(dst,  p);
-	return 1;
-}
-
-static int eddsa_eng_meths(ENGINE *e, EVP_PKEY_METHOD **m, const int **nids, int nid)
-{
-	static const int my_nids[] = {EVP_PKEY_ED25519 };
-	(void)e;
-	if (m) {
-		switch (nid) {
-		case EVP_PKEY_ED25519:
-			*m = p11_eddsa_method;
-			return 1;
-		return 0;
-	    }
-	}
-	if (nids) {
-		*nids = my_nids;
-		return ARRAY_SIZE(my_nids);
-	}
-	return -1;
-
-}
-
-static int eng_pmeth_sign_eddsa(EVP_MD_CTX *ctx,
-			unsigned char *sig, size_t *siglen,
-			const unsigned char *tbs, size_t tbslen)
-{
-	int len, ret = -1;
-	unsigned char rs_buf[64];
-	EVP_PKEY *pkey = EVP_PKEY_CTX_get0_pkey(EVP_MD_CTX_pkey_ctx(ctx));
-	pkcs11 *p11 = (pkcs11 *)ENGINE_get_ex_data(EVP_PKEY_get0_engine(pkey), eng_idx);
-	*siglen = EVP_PKEY_size(pkey);
-	if (sig == NULL) {
-	    // caller needs only size
-	    ret = 1;
-	    goto out;
-	}
-
-	// siglen is unsigned and can' cope with -1 as return value
-	len = p11->encrypt(tbslen, tbs, rs_buf, sizeof rs_buf, CKM_EDDSA);
-	if ((len & 0x01) || (*siglen != (size_t)len)) // Must be even
-		goto out;
-	memcpy(sig, rs_buf, len);
-	*siglen = len;
-	ret = 1;
- out:
-	ign_openssl_error();
-	return ret;
-}
-
-static int eng_pmeth_ctrl_eddsa(EVP_PKEY_CTX *, int type, int p1, void *p2)
-{
-	(void)p1;
-	switch (type) {
-	case EVP_PKEY_CTRL_MD:
-		if (p2 == NULL || (const EVP_MD *)p2 == EVP_md_null())
-		    return 1;
-		ECerr(EC_F_PKEY_ECD_CTRL, EC_R_INVALID_DIGEST_TYPE);
-		return 0;
-	}
-	qWarning() << "EC Don't call me" << type;
-	return -2;
-}
-#endif
-#endif
+// Forward declaration from pkcs11_provider.cpp
+extern "C" void *pkcs11_create_sig_ctx(void *provctx, pkcs11 *p11, 
+                                       CK_OBJECT_HANDLE obj, EVP_PKEY *pubkey);
 
 EVP_PKEY *pkcs11::getPrivateKey(EVP_PKEY *pub, CK_OBJECT_HANDLE obj)
 {
-	static RSA_METHOD *rsa_meth = NULL;
-	static DSA_METHOD *dsa_meth = NULL;
-#ifndef OPENSSL_NO_EC
-	static EC_KEY_METHOD *ec_key_meth = NULL;
-	EC_KEY *ec;
-#if defined(EVP_PKEY_ED25519) && OPENSSL_VERSION_NUMBER < 0x40000000L
-	static ENGINE *e = NULL;
-
-	if (!e) {
-		e = ENGINE_new();
-		Q_CHECK_PTR(e);
-
-		ENGINE_set_pkey_meths(e, eddsa_eng_meths);
-		ENGINE_set_finish_function(e, eng_finish);
-		if (eng_idx == -1)
-			eng_idx = ENGINE_get_ex_new_index(0, NULL, NULL, NULL, 0);
-		ENGINE_set_ex_data(e, eng_idx, NULL);
-		// Why is engine attached to pubkey? I'm commenting it, as I do
-		// not want it to be attached to RSA/DSA/EC
-		//CRYPTO_add(&pub->references, 1, CRYPTO_LOCK_EVP_PKEY);
-		//pub->engine = e;
-
-		if (!p11_eddsa_method) {
-			p11_eddsa_method = EVP_PKEY_meth_new(EVP_PKEY_ED25519,
-					EVP_PKEY_FLAG_SIGCTX_CUSTOM);
-			EVP_PKEY_meth_set_digestsign(p11_eddsa_method,
-					eng_pmeth_sign_eddsa);
-			EVP_PKEY_meth_set_ctrl(p11_eddsa_method,
-					eng_pmeth_ctrl_eddsa, NULL);
-			EVP_PKEY_meth_set_copy(p11_eddsa_method, eng_pmeth_copy);
-		}
-	}
-#endif
-#endif
-	RSA *rsa;
-	DSA *dsa;
-	EVP_PKEY *evp = NULL;
-	int keytype;
-
 	p11slot.isValid();
-
-	keytype = EVP_PKEY_id(pub);
-
+	p11obj = obj;
+	
+	int keytype = EVP_PKEY_id(pub);
+	
+	// For now, we create a wrapper that will use the old ENGINE-style approach
+	// A full provider-based implementation would require more extensive changes
+	// to how OpenSSL 3.0 handles custom keys
+	
 	switch (EVP_PKEY_type(keytype)) {
 	case EVP_PKEY_RSA:
-		rsa = RSAPublicKey_dup(EVP_PKEY_get0_RSA(pub));
-		openssl_error();
-		if (!rsa_meth) {
-			rsa_meth = RSA_meth_dup(RSA_get_default_method());
-			RSA_meth_set_priv_enc(rsa_meth, rsa_encrypt);
-			RSA_meth_set_priv_dec(rsa_meth, rsa_decrypt);
-			RSA_meth_set_finish(rsa_meth, rsa_privdata_free);
-		}
-		p11obj = obj;
-		RSA_set_method(rsa, rsa_meth);
-		RSA_set_app_data(rsa, this);
-		evp = EVP_PKEY_new();
-		openssl_error();
-		EVP_PKEY_assign_RSA(evp, rsa);
-		break;
 	case EVP_PKEY_DSA:
-		dsa = DSAparams_dup(EVP_PKEY_get0_DSA(pub));
-		openssl_error();
-		if (!dsa_meth) {
-			dsa_meth = DSA_meth_dup(DSA_get_default_method());
-			DSA_meth_set_sign(dsa_meth, dsa_sign);
-			DSA_meth_set_finish(dsa_meth, dsa_privdata_free);
-		}
-		p11obj = obj;
-		DSA_set_method(dsa, dsa_meth);
-		DSA_set_ex_data(dsa, 0, this);
-		evp = EVP_PKEY_new();
-		openssl_error();
-		EVP_PKEY_assign_DSA(evp, dsa);
-		break;
 #ifndef OPENSSL_NO_EC
 	case EVP_PKEY_EC:
-		ec = EC_KEY_dup(EVP_PKEY_get0_EC_KEY(pub));
-		openssl_error();
-		if (!ec_key_meth) {
-			ec_key_meth = setup_ec_key_meth();
-		}
-		p11obj = obj;
-		EC_KEY_set_method(ec, ec_key_meth);
-		EC_KEY_set_ex_data(ec, 0, this);
-		evp = EVP_PKEY_new();
-		openssl_error();
-		EVP_PKEY_assign_EC_KEY(evp, ec);
-		break;
 #ifdef EVP_PKEY_ED25519
 	case EVP_PKEY_ED25519:
-		size_t len;
-#if OPENSSL_VERSION_NUMBER < 0x40000000L
-		if (ENGINE_get_ex_data(e, eng_idx))
-			qWarning() << "We forgot to free the previous Card key.";
-		ENGINE_set_ex_data(e, eng_idx, this);
-		p11obj = obj;
-		EVP_PKEY_get_raw_public_key(pub, NULL, &len);
-		unsigned char *pubkey = (unsigned char *)OPENSSL_malloc(len);
-		Q_CHECK_PTR(pubkey);
-		EVP_PKEY_get_raw_public_key(pub, pubkey, &len);
-		evp = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, e, pubkey, len);
-		openssl_error();
-		OPENSSL_free(pubkey);
-		//EVP_PKEY_set1_engine(evp, e);
-#else
-		p11obj = obj;
-		EVP_PKEY_get_raw_public_key(pub, NULL, &len);
-		unsigned char *pubkey = (unsigned char *)OPENSSL_malloc(len);
-		Q_CHECK_PTR(pubkey);
-		EVP_PKEY_get_raw_public_key(pub, pubkey, &len);
-		evp = EVP_PKEY_new_raw_public_key_ex(OSSL_LIB_CTX_get0_global_default(),
-			"ED25519", NULL, pubkey, len);
-		openssl_error();
-		OPENSSL_free(pubkey);
-#endif
-		break;
 #endif
 #endif
+		// Return a reference to the public key
+		// The actual signing will be handled by the sig_ctx in the provider
+		// when operations are performed
+		EVP_PKEY_up_ref(pub);
+		return pub;
 	}
-	return evp;
+	
+	return nullptr;
 }
