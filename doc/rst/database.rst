@@ -70,16 +70,15 @@ The section must be named after the database driver, e.g. *QPSQL*, *QMYSQL* or *
 optionally followed by a dash and the database-hostname (exactly as used in the connection settings
 including an optional port number).
 
-Example:
+Example::
 
-```
-[QMYSQL-192.168.12.13]
-MYSQL_OPT_CONNECT_TIMEOUT=10
-MYSQL_OPT_RECONNECT=1
+  [QMYSQL-192.168.12.13]
+  MYSQL_OPT_CONNECT_TIMEOUT=10
+  MYSQL_OPT_RECONNECT=1
 
-[QMYSQL]
-MYSQL_OPT_SSL_VERIFY_SERVER_CERT=off
-```
+  [QMYSQL]
+  MYSQL_OPT_SSL_VERIFY_SERVER_CERT=off
+
 In this example the QMYSQL option is used for all connections, including those to 192.168.12.13.
 
 Also the environment variable XCA_<driver-name>_OPTIONS may be used to set the options.
