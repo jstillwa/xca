@@ -115,6 +115,11 @@ if (${QT_VERSION} VERSION_LESS 5.10.0)
 endif()
 message(STATUS "Using ${QT} with version ${QT_VERSION}")
 
+# Handle deprecation warnings
+add_compile_definitions(QT_DISABLE_DEPRECATED_UP_TO=0x050A00)
+add_compile_definitions(QT_WARN_DEPRECATED_UP_TO=0x050A00)
+message (STATUS "Force compatibility up to QT 5.10.0")
+
 get_target_property(qmake_executable ${QT}::qmake IMPORTED_LOCATION)
 get_filename_component(_qt_bin_dir "${qmake_executable}" DIRECTORY)
 
