@@ -190,8 +190,8 @@ EVP_PKEY *pki_scard::load_pubkey(pkcs11 &p11, CK_OBJECT_HANDLE object) const
 			d2i_bytearray(D2I_VOID(d2i_ASN1_OCTET_STRING), ba);
 		pki_openssl_error();
 		pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL,
-			(const uint8_t *)os->data,
-			os->length);
+			(const uint8_t *)ASN1_STRING_get0_data(os),
+			ASN1_STRING_length(os));
 		pki_openssl_error();
 		ASN1_OCTET_STRING_free(os);
 		pki_openssl_error();
