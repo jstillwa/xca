@@ -112,11 +112,17 @@ void pki_evp::generate(const keyjob &task)
 		break;
 #ifndef OPENSSL_NO_EC
 	case EVP_PKEY_EC:
+		EVP_PKEY_paramgen_init(ctx);
 		EVP_PKEY_CTX_set_ec_paramgen_curve_nid(ctx, task.ec_nid);
+		EVP_PKEY_generate(ctx, &param_key);
+		EVP_PKEY_CTX_free(ctx);
+		ctx = EVP_PKEY_CTX_new_from_pkey(NULL, param_key, NULL);
 		break;
 	case EVP_PKEY_ED25519:
 		// ED25519 and ED448 need no extra treatment
 		break;
+	default:
+		throw errorEx(tr("Unknown Keytype %1").arg(task.ktype.type));
 #endif
 	}
 	EVP_PKEY *pkey = nullptr;
@@ -125,12 +131,12 @@ void pki_evp::generate(const keyjob &task)
 	EVP_PKEY_CTX_free(ctx);
 	isPub = false;
 	pkiSource = generated;
-	pki_openssl_error();
 	if (param_key)
 		EVP_PKEY_free(param_key);
 	if (key)
 		EVP_PKEY_free(key);
 	key = pkey;
+	pki_openssl_error();
 	encryptKey();
 }
 
