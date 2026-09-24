@@ -353,6 +353,20 @@ static pki_key *generateKey(const QJsonObject &k, const QJsonObject &job)
 	return stored;
 }
 
+/* NewX509::accept() warns when an issuer's name constraints are
+ * violated. Without a user to confirm, refuse instead. */
+static void checkNameConstraints(pki_x509 *cert, pki_x509 *issuer)
+{
+	for (pki_x509 *crt = issuer, *prev = nullptr; crt && crt != prev;
+			prev = crt, crt = crt->getSigner()) {
+		int rc = cert->name_constraint_check(crt);
+		if (rc != X509_V_OK)
+			throw errorEx(QObject::tr("A name constraint of the issuer "
+				"'%1' is violated: %2").arg(crt->getIntName())
+				.arg(get_ossl_verify_error(rc)));
+	}
+}
+
 static pki_x509 *issue(const QJsonObject &job, db_x509 *certs,
 			pki_x509req **reqOut)
 {
@@ -442,6 +456,8 @@ static pki_x509 *issue(const QJsonObject &job, db_x509 *certs,
 			for (int i = 0; i < el.count(); i++)
 				cert->addV3ext(el[i], true);
 		}
+
+		checkNameConstraints(cert, issuer);
 
 		digest md = job.contains("hash") ?
 			digest(job["hash"].toString()) : digest::getDefault();
