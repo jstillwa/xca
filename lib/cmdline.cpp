@@ -23,6 +23,7 @@
 #include "BioByteArray.h"
 #include "db_x509.h"
 #include "db_crl.h"
+#include "cli_sign.h"
 
 static const char *xca_name = "xca";
 static void cmd_version(FILE *fp)
@@ -206,6 +207,14 @@ int read_cmdline(int argc, char *argv[], bool console_only,
 				.arg(iss->getIntName());
 		}
 		console_write(stdout, out.join("\n").toUtf8() + '\n');
+	}
+	if (cmd_opts.has("certgen")) {
+		try {
+			cmdline_items->append_item(cli_certgen(cmd_opts["certgen"]));
+		} catch (errorEx &err) {
+			XCA_ERROR(err);
+			return EXIT_FAILURE;
+		}
 	}
 	if (cmd_opts.has("crlgen")) {
 		db_crl *crls = Database.model<db_crl>();
