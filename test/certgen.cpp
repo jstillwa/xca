@@ -81,6 +81,9 @@ void test_main::certgen()
 	QVERIFY(!cert->isCA());
 	QCOMPARE(cert->getSubject().getEntryByNid(NID_commonName),
 		QString("*.example.net"));
+	/* Entry order follows explicit_dn like the GUI, not the JSON */
+	QCOMPARE(cert->getSubject().oneLine(XN_FLAG_RFC2253),
+		QString("CN=*.example.net,O=Test"));
 	QCOMPARE(cert->getNotBefore().daysTo(cert->getNotAfter()), qint64(30));
 	for (int nid : { NID_basic_constraints, NID_subject_key_identifier,
 			NID_authority_key_identifier, NID_key_usage,

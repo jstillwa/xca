@@ -308,6 +308,42 @@ static void applyExtensions(const extConf &c, X509V3_CTX *ctx)
 	}
 }
 
+/* Replace or add the JSON entries and lay the name out like
+ * NewX509::getX509name(): the explicit_dn fields in their configured
+ * order first, then all other entries in their original order.
+ * The same entries in another order form a different DN. */
+static x509name mergeSubject(const x509name &base, const QJsonObject &js)
+{
+	QList<QPair<int, QString>> entries;
+	for (int i = 0; i < base.entryCount(); i++)
+		entries << qMakePair(base.nid(i), base.getEntry(i));
+	foreach(QString k, js.keys()) {
+		int nid = OBJ_txt2nid(CCHAR(k));
+		if (nid == NID_undef)
+			throw errorEx(QObject::tr("Unknown subject field '%1'")
+					.arg(k));
+		for (int i = entries.size() - 1; i >= 0; i--)
+			if (entries[i].first == nid)
+				entries.removeAt(i);
+		entries << qMakePair(nid, js[k].toString());
+	}
+	x509name out;
+	foreach(QString sn, Settings["explicit_dn"].split(",")) {
+		int nid = OBJ_txt2nid(CCHAR(sn.trimmed()));
+		for (int i = 0; i < entries.size(); ) {
+			if (entries[i].first == nid) {
+				out.addEntryByNid(nid, entries[i].second);
+				entries.removeAt(i);
+			} else {
+				i++;
+			}
+		}
+	}
+	for (const auto &e : entries)
+		out.addEntryByNid(e.first, e.second);
+	return out;
+}
+
 static a1time templateNotAfter(const a1time &nb, pki_temp *t)
 {
 	int n = t->getSettingInt("validN");
@@ -400,19 +436,8 @@ static pki_x509 *issue(const QJsonObject &job, db_x509 *certs,
 		x509name subj = req ? req->getSubject() :
 				(temp ? temp->getSubject() : x509name());
 		QJsonObject js = job["subject"].toObject();
-		if (!js.isEmpty()) {
-			x509name merged;
-			foreach(QString k, js.keys()) {
-				int nid = OBJ_txt2nid(CCHAR(k));
-				if (nid == NID_undef)
-					throw errorEx(QObject::tr("Unknown subject "
-						"field '%1'").arg(k));
-				subj.popEntryByNid(nid);
-				merged.addEntryByNid(nid, js[k].toString());
-			}
-			for (int i = 0; i < merged.entryCount(); i++)
-				subj.addEntryByNid(merged.nid(i), merged.getEntry(i));
-		}
+		if (!js.isEmpty())
+			subj = mergeSubject(subj, js);
 		if (subj.entryCount() == 0)
 			throw errorEx(QObject::tr("Empty subject"));
 
