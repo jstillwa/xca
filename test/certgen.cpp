@@ -135,6 +135,32 @@ void test_main::certgen()
 		QFile::Permissions());
 #endif
 
+	/* Console mode leaves the database password unvalidated and offers
+	 * --password to the first prompt only. A job that decrypts several
+	 * keys must still succeed, and a wrong password must fail loudly. */
+	Passwd dbpass = pki_evp::passwd;
+	QTemporaryFile f4;
+	QString job4 = jobFile(f4, QString(R"({
+		"issuer": "Root CA", "key": { "generate": "EC:prime256v1" },
+		"subject": { "CN": "console.example.net" }, "days": 1,
+		"output": { "key": "%1/k2.pem" } })").arg(dir.path()).toUtf8());
+
+	pki_evp::passwd = Passwd();
+	pwdialog->setExpectations(QList<pw_expect*>{
+		new pw_expect("wrong", pw_ok),
+	});
+	int n = Store.getAll<pki_x509>().size();
+	QVERIFY_EXCEPTION_THROWN(cli_certgen(job4), errorEx);
+	QCOMPARE(Store.getAll<pki_x509>().size(), n);
+
+	pki_evp::passwd = Passwd();
+	pwdialog->setExpectations(QList<pw_expect*>{
+		new pw_expect(dbpass.constData(), pw_ok),
+	});
+	QVERIFY(cli_certgen(job4));
+	QCOMPARE(pwdialog->expect_idx, 1);
+	QVERIFY(QFile::exists(dir.path() + "/k2.pem"));
+
 	/* Invalid jobs are refused before anything is stored */
 	int before = Store.getAll<pki_x509>().size();
 	for (QByteArray bad : {

@@ -34,6 +34,8 @@
 #include "x509rev.h"
 #include "xfile.h"
 #include "pki_evp.h"
+#include "PwDialogCore.h"
+#include "pass_info.h"
 
 static const QSet<QString> job_keys = {
 	"renew", "keep_serial", "issuer", "key", "csr", "template",
@@ -521,6 +523,26 @@ static void writeOutput(const QJsonObject &o, pki_x509 *cert)
 	openssl_error();
 }
 
+/* Console mode opens the database without checking its password, and the
+ * --password value is consumed by the first prompt. A job may need the
+ * database password several times (new key, CA key), so validate it
+ * once here and keep it for the whole job. */
+static void unlockDatabasePassword()
+{
+	if (pki_evp::validateDatabasePassword(pki_evp::passwd))
+		return;
+	if (pki_evp::passHash.isEmpty())
+		return;
+	pass_info p(XCA_TITLE, QObject::tr("Please enter the database "
+			"password"));
+	Passwd pass;
+	if (PwDialogCore::execute(&p, &pass, false) != pw_ok ||
+	    !pki_evp::validateDatabasePassword(pass))
+		throw errorEx(QObject::tr("Wrong or missing database password. "
+			"Use --password"));
+	pki_evp::passwd = pass;
+}
+
 pki_x509 *cli_certgen(const QString &jsonfile)
 {
 	QFile file(jsonfile);
@@ -535,10 +557,17 @@ pki_x509 *cli_certgen(const QString &jsonfile)
 	QJsonObject job = doc.object();
 	rejectUnknown(job, job_keys, jsonfile);
 
+	unlockDatabasePassword();
+
 	db_x509 *certs = Database.model<db_x509>();
 	pki_x509req *req = NULL;
-	pki_x509 *cert = job.contains("renew") ?
-		renew(job, certs) : issue(job, certs, &req);
+	pki_x509 *cert;
+	try {
+		cert = job.contains("renew") ?
+			renew(job, certs) : issue(job, certs, &req);
+	} catch (enum open_result) {
+		throw errorEx(QObject::tr("Password input aborted"));
+	}
 
 	cert = dynamic_cast<pki_x509 *>(certs->insert(cert));
 	if (!cert)
