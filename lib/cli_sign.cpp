@@ -217,6 +217,8 @@ struct jobResult {
 	pki_x509req *req{};      /* request to mark as signed */
 };
 
+static void checkNameConstraints(pki_x509 *cert, pki_x509 *issuer);
+
 static void renew(const QJsonObject &job, db_x509 *certs, jobResult &r)
 {
 	pki_x509 *old = lookup<pki_x509>(ref(job, "renew"), "Certificate");
@@ -224,6 +226,12 @@ static void renew(const QJsonObject &job, db_x509 *certs, jobResult &r)
 	if (!signer || signer == old)
 		throw errorEx(QObject::tr("Certificate '%1' has no known issuer "
 			"in the database").arg(old->getIntName()));
+	/* The recorded signer is whichever stored certificate verifies the
+	 * old signature; it is not necessarily a CA. Issuance checks the
+	 * same through resolveIssuer(). */
+	if (!signer->canSign())
+		throw errorEx(QObject::tr("Issuer '%1' is not a CA with a "
+			"private key").arg(signer->getIntName()));
 	pki_key *signkey = signer->getRefKey();
 	checkSignKey(signkey);
 
@@ -254,6 +262,7 @@ static void renew(const QJsonObject &job, db_x509 *certs, jobResult &r)
 		checkInterval(notBefore, notAfter);
 		cert->setNotBefore(notBefore);
 		cert->setNotAfter(notAfter);
+		checkNameConstraints(cert, signer);
 		cert->sign(signkey, old->getDigest());
 	} catch (...) {
 		delete cert;

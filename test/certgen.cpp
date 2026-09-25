@@ -292,6 +292,59 @@ void test_main::certgen()
 		QCOMPARE(p.exitCode(), 0);
 	}
 
+	/* Renewal signs only with a CA, and refuses a certificate that
+	 * violates its issuer's name constraints, as issuance does. */
+	{
+		db_x509 *certs = Database.model<db_x509>();
+		QTemporaryFile fn1, fn2, fn3, fn4;
+		/* intermediate CA limited to .inside.example */
+		pki_x509 *ica = cli_certgen(jobFile(fn1, QString(R"({
+			"issuer": "Root CA", "key": { "generate": "EC:prime256v1" },
+			"name": "constrained CA", "subject": { "CN": "constrained CA" }, "days": 30,
+			"extensions": { "basicConstraints": "critical, CA:TRUE",
+				"keyUsage": "critical, keyCertSign, cRLSign",
+				"nameConstraints": "critical, permitted;DNS:.inside.example" } })").toUtf8()));
+		QVERIFY(ica && ica->canSign());
+		/* a compliant leaf, then the same leaf forged with an outside SAN
+		 * the way an imported or GUI-overridden certificate could be */
+		pki_x509 *leaf = cli_certgen(jobFile(fn2, QString(R"({
+			"issuer": "%1", "key": "%2", "subject": { "CN": "a.inside.example" },
+			"days": 30, "extensions": { "subjectAltName": "DNS:a.inside.example" } })")
+			.arg(ica->getSqlItemId().toString(), keyId).toUtf8()));
+		QVERIFY(leaf);
+		pki_x509 *outside = new pki_x509(leaf);
+		outside->setSubject(x509name());
+		x509name on;
+		on.addEntryByNid(NID_commonName, "b.outside.example");
+		outside->setSubject(on);
+		outside->setSerial(certs->getUniqueSerial(ica));
+		outside->sign(ica->getRefKey(), digest::getDefault());
+		outside->setIntName("outside");
+		outside = dynamic_cast<pki_x509*>(certs->insert(outside));
+		QVERIFY(outside && outside->getSigner() == ica);
+		int nNc = Store.getAll<pki_x509>().size();
+		QVERIFY_EXCEPTION_THROWN(cli_certgen(jobFile(fn3, QString(
+			R"({ "renew": "%1", "days": 1 })")
+			.arg(outside->getSqlItemId().toString()).toUtf8())), errorEx);
+		QCOMPARE(Store.getAll<pki_x509>().size(), nNc);
+
+		/* a certificate whose recorded signer is not a CA */
+		pki_x509 *child = new pki_x509(leaf);
+		child->setIssuer(leaf->getSubject());
+		child->setSerial(certs->getUniqueSerial(leaf));
+		child->sign(subjectKey, digest::getDefault());
+		child->setIntName("signed by a leaf");
+		child = dynamic_cast<pki_x509*>(certs->insert(child));
+		QVERIFY(child);
+		/* Issuer discovery would not pick a non-CA; record it directly,
+		 * as a database written by another tool could. */
+		child->setSigner(leaf);
+		QVERIFY(!leaf->isCA());
+		QVERIFY_EXCEPTION_THROWN(cli_certgen(jobFile(fn4, QString(
+			R"({ "renew": "%1", "days": 1 })")
+			.arg(child->getSqlItemId().toString()).toUtf8())), errorEx);
+	}
+
 	/* A password prompt that aborts by throwing (the Windows console
 	 * path throws pw_exit) must reach the caller as errorEx, which the
 	 * command line turns into a failure exit status, whether it happens
