@@ -11,21 +11,39 @@
 #include <QByteArray>
 #include <QString>
 
-/* Write data to path so that only the current user can read it, and
- * throw errorEx when that cannot be guaranteed. The file is written to a
- * temporary name beside path and renamed over it, so a failed write
- * leaves an existing file untouched. On Windows the new file gets a
- * protected DACL that grants access to its owner only; inherited ACEs
- * from the directory never apply. */
-void write_owner_only_file(const QString &path, const QByteArray &data);
+/* A file written in two steps. The constructor writes the data to a new,
+ * uniquely named temporary file beside the destination and throws errorEx
+ * on any short write. commit() renames it over the destination. A staged
+ * file that is never committed is deleted by the destructor, so a caller
+ * can prepare several outputs and publish them only after everything
+ * else has succeeded.
+ *
+ * With owner_only, the temporary file is created readable by the current
+ * user only (mode 0600; on Windows a protected DACL granting OWNER RIGHTS
+ * only, so ACEs inherited from the folder never apply), and commit()
+ * verifies the published file. Renaming replaces an existing destination
+ * instead of reusing its permissions. */
+class staged_file
+{
+  public:
+	staged_file(const QString &path, const QByteArray &data, bool owner_only);
+	~staged_file();
+	void commit();
+	staged_file(const staged_file &) = delete;
+	staged_file &operator=(const staged_file &) = delete;
 
-/* Write data to path atomically (temporary file plus rename), with
- * default permissions. Throws errorEx on any short write. */
+  private:
+	QString dest{}, tmp{};
+	bool owner_only{}, done{};
+};
+
+/* Stage and commit in one call. */
+void write_owner_only_file(const QString &path, const QByteArray &data);
 void write_file_atomic(const QString &path, const QByteArray &data);
 
 /* True when path is readable by its owner only: on Windows, a protected
- * DACL whose access-allowed entries all name the owner; elsewhere, no
- * group or other permission bits. */
+ * DACL whose access-allowed entries all name the owner or OWNER RIGHTS;
+ * elsewhere, no group or other permission bits. */
 bool is_owner_only_file(const QString &path);
 
 #endif

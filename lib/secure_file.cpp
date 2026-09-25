@@ -5,10 +5,11 @@
  * All rights reserved.
  */
 
+#include <QAtomicInt>
+#include <QCoreApplication>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
-#include <QSaveFile>
 
 #include "secure_file.h"
 #include "exception.h"
@@ -21,7 +22,10 @@
 #include <sddl.h>
 #include <string>
 #else
-#include <sys/stat.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
 #endif
 
 static errorEx fileError(const QString &what, const QString &path)
@@ -29,17 +33,15 @@ static errorEx fileError(const QString &what, const QString &path)
 	return errorEx(QObject::tr("%1 '%2'").arg(what).arg(path));
 }
 
-void write_file_atomic(const QString &path, const QByteArray &data)
+/* Unique within the process and across processes: pid plus a counter.
+ * The file is created exclusively, so a leftover or planted file with the
+ * same name makes the write fail instead of being reused. */
+static QString tempName(const QString &dest)
 {
-	QSaveFile f(path);
-	if (!f.open(QIODevice::WriteOnly))
-		throw fileError(QObject::tr("Cannot write"), path);
-	if (f.write(data) != data.size()) {
-		f.cancelWriting();
-		throw fileError(QObject::tr("Short write to"), path);
-	}
-	if (!f.commit())
-		throw fileError(QObject::tr("Cannot replace"), path);
+	static QAtomicInt counter;
+	return QString("%1.%2.%3.tmp").arg(dest)
+		.arg(QCoreApplication::applicationPid())
+		.arg(counter.fetchAndAddRelaxed(1));
 }
 
 #if defined(Q_OS_WIN32)
@@ -50,37 +52,24 @@ static std::wstring native(const QString &path)
 		.toStdWString();
 }
 
-/* Security descriptor for a new file: owner = current user, DACL
- * protected against inheritance, one ACE granting the owner full
- * control. "OW" is the SDDL owner-rights SID, which resolves to the
- * creating user. */
-static PSECURITY_DESCRIPTOR ownerOnlyDescriptor()
+staged_file::staged_file(const QString &path, const QByteArray &data,
+			bool secret)
+	: dest(path), tmp(tempName(path)), owner_only(secret)
 {
+	/* D:P = protected DACL (no inheritance); one ACE granting full
+	 * access to OWNER RIGHTS (OW), which resolves to the file's owner. */
 	PSECURITY_DESCRIPTOR sd = NULL;
-	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+	if (owner_only && !ConvertStringSecurityDescriptorToSecurityDescriptorW(
 			L"D:P(A;;FA;;;OW)", SDDL_REVISION_1, &sd, NULL))
-		return NULL;
-	return sd;
-}
-
-void write_owner_only_file(const QString &path, const QByteArray &data)
-{
-	std::wstring dest = native(path);
-	/* Unique temporary name in the destination directory: CREATE_NEW
-	 * refuses an existing name, so a leftover or planted file cannot be
-	 * reused, and rename stays on the same volume. */
-	std::wstring tmp = dest + L"." +
-		std::to_wstring(GetCurrentProcessId()) + L"." +
-		std::to_wstring(GetTickCount64()) + L".tmp";
-
-	PSECURITY_DESCRIPTOR sd = ownerOnlyDescriptor();
-	if (!sd)
-		throw fileError(QObject::tr("Cannot build an owner-only ACL for"), path);
+		throw fileError(QObject::tr("Cannot build an owner-only ACL for"),
+				path);
 	SECURITY_ATTRIBUTES sa = { sizeof(sa), sd, FALSE };
 
-	HANDLE h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, &sa,
-				CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-	LocalFree(sd);
+	HANDLE h = CreateFileW(native(tmp).c_str(), GENERIC_WRITE, 0,
+				owner_only ? &sa : NULL, CREATE_NEW,
+				FILE_ATTRIBUTE_NORMAL, NULL);
+	if (sd)
+		LocalFree(sd);
 	if (h == INVALID_HANDLE_VALUE)
 		throw fileError(QObject::tr("Cannot create"), path);
 
@@ -90,23 +79,30 @@ void write_owner_only_file(const QString &path, const QByteArray &data)
 			FlushFileBuffers(h);
 	CloseHandle(h);
 	if (!ok) {
-		DeleteFileW(tmp.c_str());
+		DeleteFileW(native(tmp).c_str());
 		throw fileError(QObject::tr("Short write to"), path);
 	}
-	/* Rename keeps the temporary file's own protected DACL; an existing
-	 * destination with looser permissions is replaced, not reused. */
-	if (!MoveFileExW(tmp.c_str(), dest.c_str(),
-			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-		DeleteFileW(tmp.c_str());
-		throw fileError(QObject::tr("Cannot replace"), path);
-	}
-	if (!is_owner_only_file(path))
-		throw fileError(QObject::tr("Owner-only ACL did not apply to"), path);
 }
 
-/* An access-allowed ACE is owner-only when it names the file's owner
- * or the OWNER RIGHTS SID (S-1-3-4, SDDL "OW"), which the system
- * resolves to whoever owns the file. */
+staged_file::~staged_file()
+{
+	if (!done)
+		DeleteFileW(native(tmp).c_str());
+}
+
+void staged_file::commit()
+{
+	if (!MoveFileExW(native(tmp).c_str(), native(dest).c_str(),
+			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+		throw fileError(QObject::tr("Cannot replace"), dest);
+	done = true;
+	if (owner_only && !is_owner_only_file(dest))
+		throw fileError(QObject::tr("Owner-only ACL did not apply to"), dest);
+}
+
+/* An access-allowed ACE is owner-only when it names the file's owner or
+ * the OWNER RIGHTS SID (S-1-3-4), which the system resolves to whoever
+ * owns the file. */
 static bool ownerSid(PSID sid, PSID owner)
 {
 	BYTE buf[SECURITY_MAX_SID_SIZE];
@@ -122,8 +118,7 @@ bool is_owner_only_file(const QString &path)
 	PSID owner = NULL;
 	PACL dacl = NULL;
 	PSECURITY_DESCRIPTOR sd = NULL;
-	std::wstring w = native(path);
-	if (GetNamedSecurityInfoW(w.c_str(), SE_FILE_OBJECT,
+	if (GetNamedSecurityInfoW(native(path).c_str(), SE_FILE_OBJECT,
 			OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
 			&owner, NULL, &dacl, NULL, &sd) != ERROR_SUCCESS)
 		return false;
@@ -147,25 +142,52 @@ bool is_owner_only_file(const QString &path)
 
 #else
 
-void write_owner_only_file(const QString &path, const QByteArray &data)
+staged_file::staged_file(const QString &path, const QByteArray &data,
+			bool secret)
+	: dest(path), tmp(tempName(path)), owner_only(secret)
 {
-	/* QSaveFile creates its temporary file with the process umask;
-	 * restrict it before any byte is written. */
-	QSaveFile f(path);
-	if (!f.open(QIODevice::WriteOnly))
-		throw fileError(QObject::tr("Cannot write"), path);
-	if (!f.setPermissions(QFile::ReadOwner | QFile::WriteOwner)) {
-		f.cancelWriting();
-		throw fileError(QObject::tr("Cannot restrict permissions of"), path);
+	/* The mode is set at creation: an owner-only file is never readable
+	 * by others, not even while empty. Other files get 0666 & ~umask. */
+	QByteArray t = QFile::encodeName(tmp);
+	int fd = ::open(t.constData(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+			owner_only ? 0600 : 0666);
+	if (fd < 0)
+		throw fileError(QObject::tr("Cannot create"), path);
+	const char *p = data.constData();
+	qint64 left = data.size();
+	while (left > 0) {
+		ssize_t n = ::write(fd, p, left);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		p += n;
+		left -= n;
 	}
-	if (f.write(data) != data.size()) {
-		f.cancelWriting();
+	bool ok = left == 0 && ::fsync(fd) == 0;
+	if (::close(fd) != 0)
+		ok = false;
+	if (!ok) {
+		::unlink(t.constData());
 		throw fileError(QObject::tr("Short write to"), path);
 	}
-	if (!f.commit())
-		throw fileError(QObject::tr("Cannot replace"), path);
-	if (!is_owner_only_file(path))
-		throw fileError(QObject::tr("Owner-only permissions did not apply to"), path);
+}
+
+staged_file::~staged_file()
+{
+	if (!done)
+		::unlink(QFile::encodeName(tmp).constData());
+}
+
+void staged_file::commit()
+{
+	if (::rename(QFile::encodeName(tmp).constData(),
+			QFile::encodeName(dest).constData()) != 0)
+		throw fileError(QObject::tr("Cannot replace"), dest);
+	done = true;
+	if (owner_only && !is_owner_only_file(dest))
+		throw fileError(QObject::tr("Owner-only permissions did not apply to"),
+				dest);
 }
 
 bool is_owner_only_file(const QString &path)
@@ -177,3 +199,15 @@ bool is_owner_only_file(const QString &path)
 }
 
 #endif
+
+void write_owner_only_file(const QString &path, const QByteArray &data)
+{
+	staged_file f(path, data, true);
+	f.commit();
+}
+
+void write_file_atomic(const QString &path, const QByteArray &data)
+{
+	staged_file f(path, data, false);
+	f.commit();
+}

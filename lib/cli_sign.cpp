@@ -120,7 +120,17 @@ static void checkSignKey(pki_key *key)
 		throw errorEx(QObject::tr("The issuer has no private key"));
 }
 
-static pki_x509 *renew(const QJsonObject &job, db_x509 *certs)
+/* Everything a job produced before anything is stored. cert and
+ * newKey are owned here until they are inserted into the database. */
+struct jobResult {
+	pki_x509 *cert{};        /* signed, not yet stored */
+	pki_x509 *issuer{};      /* stored CA that signed cert */
+	pki_evp *newKey{};       /* generated subject key, not yet stored */
+	pki_key *outKey{};       /* private key for output.key, if any */
+	pki_x509req *req{};      /* request to mark as signed */
+};
+
+static void renew(const QJsonObject &job, db_x509 *certs, jobResult &r)
 {
 	pki_x509 *old = lookup<pki_x509>(ref(job, "renew"), "Certificate");
 	pki_x509 *signer = old->getSigner();
@@ -154,7 +164,9 @@ static pki_x509 *renew(const QJsonObject &job, db_x509 *certs)
 		delete cert;
 		throw;
 	}
-	return cert;
+	r.cert = cert;
+	r.issuer = signer;
+	r.outKey = old->getRefKey();
 }
 
 /* Collected extension config strings in the order NewX509::getAllExt()
@@ -358,9 +370,10 @@ static a1time templateNotAfter(const a1time &nb, pki_temp *t)
 	return a1time(dt);
 }
 
-/* "key": { "generate": "RSA:4096" } creates the subject key in the
- * database, named after the job, as the "New key" dialog would. */
-static pki_key *generateKey(const QJsonObject &k, const QJsonObject &job)
+/* "key": { "generate": "RSA:4096" } creates the subject key, named after
+ * the job, as the "New key" dialog would. The key is returned unstored;
+ * cli_certgen() stores it together with the certificate. */
+static pki_evp *generateKey(const QJsonObject &k, const QJsonObject &job)
 {
 	rejectUnknown(k, { "generate", "name" }, "'key'");
 	keyjob task(k["generate"].toString());
@@ -384,11 +397,7 @@ static pki_key *generateKey(const QJsonObject &k, const QJsonObject &job)
 		delete key;
 		throw;
 	}
-	pki_key *stored = dynamic_cast<pki_key *>(
-		Database.model<db_key>()->insert(key));
-	if (!stored)
-		throw errorEx(QObject::tr("Generated key was not stored"));
-	return stored;
+	return key;
 }
 
 /* NewX509::accept() warns when an issuer's name constraints are
@@ -405,8 +414,7 @@ static void checkNameConstraints(pki_x509 *cert, pki_x509 *issuer)
 	}
 }
 
-static pki_x509 *issue(const QJsonObject &job, db_x509 *certs,
-			pki_x509req **reqOut)
+static void issue(const QJsonObject &job, db_x509 *certs, jobResult &r)
 {
 	pki_x509 *issuer = resolveIssuer(ref(job, "issuer"));
 	pki_key *signkey = issuer->getRefKey();
@@ -428,16 +436,17 @@ static pki_x509 *issue(const QJsonObject &job, db_x509 *certs,
 		if (!subjKey)
 			subjKey = tempKey = req->getPubKey();
 	} else if (job["key"].isObject()) {
-		subjKey = generateKey(job["key"].toObject(), job);
+		subjKey = r.newKey = generateKey(job["key"].toObject(), job);
 	} else {
 		subjKey = lookup<pki_key>(ref(job, "key"), "Key");
 	}
 
-	pki_temp *temp = job.contains("template") ?
-		lookup<pki_temp>(ref(job, "template"), "Template") : NULL;
-
-	pki_x509 *cert = new pki_x509();
+	pki_temp *temp = NULL;
+	pki_x509 *cert = NULL;
 	try {
+		if (job.contains("template"))
+			temp = lookup<pki_temp>(ref(job, "template"), "Template");
+		cert = new pki_x509();
 		/* Subject: template, then CSR, then explicit JSON entries */
 		x509name subj = req ? req->getSubject() :
 				(temp ? temp->getSubject() : x509name());
@@ -501,59 +510,64 @@ static pki_x509 *issue(const QJsonObject &job, db_x509 *certs,
 	} catch (...) {
 		delete cert;
 		delete tempKey;
+		delete r.newKey;
+		r.newKey = NULL;
 		throw;
 	}
 	delete tempKey;
-	*reqOut = req;
-	return cert;
-}
-
-static void writeFile(const QString &path, const QByteArray &data,
-			bool secret)
-{
-	if (secret)
-		write_owner_only_file(path, data);
-	else
-		write_file_atomic(path, data);
+	r.cert = cert;
+	r.issuer = issuer;
+	r.outKey = tempKey ? NULL : subjKey;
+	r.req = req;
 }
 
 /* "output": { "cert": ..., "chain": ..., "key": ... }
  * chain holds the certificate followed by its issuers up to the root.
  * key is written unencrypted with owner-only access (a protected DACL
  * on Windows, mode 0600 elsewhere), because its consumers (web servers,
- * Kubernetes TLS secrets) need it plain. Every file is written to a
- * temporary name and renamed into place, so a failed write keeps the
- * previous file. */
-static void writeOutput(const QJsonObject &o, pki_x509 *cert)
+ * Kubernetes TLS secrets) need it plain.
+ * Files are only staged here, as temporary files beside their
+ * destinations; cli_certgen() publishes them after the database commit. */
+static void stageOutput(const QJsonObject &o, const jobResult &r,
+			QList<staged_file *> &staged)
 {
 	rejectUnknown(o, output_keys, "'output'");
 	if (o.contains("cert")) {
 		BioByteArray b;
-		PEM_write_bio_X509(b, cert->getCert());
-		writeFile(o["cert"].toString(), b, false);
+		PEM_write_bio_X509(b, r.cert->getCert());
+		staged << new staged_file(o["cert"].toString(), b, false);
 	}
 	if (o.contains("chain")) {
 		BioByteArray b;
-		pki_x509 *c = cert, *prev = nullptr;
-		while (c && c != prev) {
+		PEM_write_bio_X509(b, r.cert->getCert());
+		for (pki_x509 *c = r.issuer, *prev = r.cert; c && c != prev;
+				prev = c, c = c->getSigner())
 			PEM_write_bio_X509(b, c->getCert());
-			prev = c;
-			c = c->getSigner();
-		}
-		writeFile(o["chain"].toString(), b, false);
+		staged << new staged_file(o["chain"].toString(), b, false);
 	}
 	if (o.contains("key")) {
-		pki_evp *key = dynamic_cast<pki_evp *>(cert->getRefKey());
+		pki_evp *key = dynamic_cast<pki_evp *>(r.outKey);
 		if (!key || key->isPubKey())
 			throw errorEx(QObject::tr("No private key for '%1' in "
-				"the database").arg(cert->getIntName()));
+				"the database").arg(r.cert->getIntName()));
 		EVP_PKEY *pkey = key->decryptKey();
 		BioByteArray b;
 		PEM_write_bio_PrivateKey(b, pkey, NULL, NULL, 0, NULL, NULL);
 		EVP_PKEY_free(pkey);
-		writeFile(o["key"].toString(), b, true);
+		staged << new staged_file(o["key"].toString(), b, true);
 	}
 	openssl_error();
+}
+
+/* Remove an item that insertPKI() added to the in-memory store when the
+ * surrounding transaction rolls back. */
+static void forget(db_base *model, pki_base *pki)
+{
+	if (!pki)
+		return;
+	model->remFromCont(model->index(pki));
+	Store.remove(pki->getSqlItemId());
+	delete pki;
 }
 
 /* Console mode opens the database without checking its password, and the
@@ -593,21 +607,68 @@ pki_x509 *cli_certgen(const QString &jsonfile)
 	unlockDatabasePassword();
 
 	db_x509 *certs = Database.model<db_x509>();
-	pki_x509req *req = NULL;
-	pki_x509 *cert;
+	db_key *keys = Database.model<db_key>();
+	jobResult r;
 	try {
-		cert = job.contains("renew") ?
-			renew(job, certs) : issue(job, certs, &req);
+		if (job.contains("renew"))
+			renew(job, certs, r);
+		else
+			issue(job, certs, r);
 	} catch (enum open_result) {
 		throw errorEx(QObject::tr("Password input aborted"));
 	}
 
-	cert = dynamic_cast<pki_x509 *>(certs->insert(cert));
-	if (!cert)
-		throw errorEx(QObject::tr("Certificate was not stored"));
+	/* Every step that can fail runs before the database is written, so
+	 * a failed job stores nothing and leaves existing files untouched.
+	 * The key, the certificate and the request update share one
+	 * transaction, as db_x509::newCert() does. */
+	QList<staged_file *> staged;
+	pki_key *storedKey = NULL;
+	pki_x509 *cert = NULL;
+	try {
+		if (job.contains("output"))
+			stageOutput(job["output"].toObject(), r, staged);
+
+		Transaction;
+		TransThrow();
+		if (r.newKey) {
+			pki_evp *k = r.newKey;
+			r.newKey = NULL;         /* insert() owns it from here */
+			storedKey = dynamic_cast<pki_key *>(keys->insert(k));
+			if (!storedKey)
+				throw errorEx(QObject::tr("Generated key was not stored"));
+		}
+		pki_x509 *c = r.cert;
+		r.cert = NULL;
+		cert = dynamic_cast<pki_x509 *>(certs->insert(c));
+		if (!cert)
+			throw errorEx(QObject::tr("Certificate was not stored"));
+		certs->markRequestSigned(r.req, cert);
+		if (!TransCommit())
+			throw errorEx(QObject::tr("Failed to commit the database "
+				"transaction"));
+	} catch (...) {
+		/* ponytail: in-memory tree changes that inToCont() made for a
+		 * CA certificate (adopted children) are not reverted; the CLI
+		 * exits right after a failed job. */
+		forget(certs, cert);
+		forget(keys, storedKey);
+		delete r.cert;
+		delete r.newKey;
+		qDeleteAll(staged);
+		throw;
+	}
 	certs->createSuccess(cert);
-	certs->markRequestSigned(req, cert);
-	if (job.contains("output"))
-		writeOutput(job["output"].toObject(), cert);
+
+	try {
+		for (staged_file *f : staged)
+			f->commit();
+	} catch (errorEx &e) {
+		qDeleteAll(staged);
+		throw errorEx(QObject::tr("Certificate '%1' was stored, but "
+			"writing its output failed: %2").arg(cert->getIntName())
+			.arg(e.getString()));
+	}
+	qDeleteAll(staged);
 	return cert;
 }

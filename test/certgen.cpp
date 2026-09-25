@@ -17,6 +17,7 @@
 #include "lib/pki_x509req.h"
 #include "lib/cli_sign.h"
 #include "lib/secure_file.h"
+#include "lib/sql.h"
 #include "lib/settings.h"
 #include "lib/BioByteArray.h"
 
@@ -192,6 +193,44 @@ void test_main::certgen()
 	QVERIFY_EXCEPTION_THROWN(cli_certgen(jobFile(f6, QString(R"({ "issuer": "Root CA",
 		"csr": "%1", "days": 1 })").arg(tampered->getSqlItemId().toString()).toUtf8())), errorEx);
 	QCOMPARE(Store.getAll<pki_x509>().size(), nCsr);
+
+	/* A failed job leaves no trace: no certificate, no generated key,
+	 * no output file, and the database stays consistent with Store. */
+	QTemporaryFile f7;
+	int keysBefore = Store.getAll<pki_key>().size();
+	int certsBefore = Store.getAll<pki_x509>().size();
+	QString unwritable = dir.path() + "/no-such-dir/k.pem";
+	for (QByteArray failing : {
+		/* fails after key generation, before signing */
+		QByteArray(R"({ "issuer": "Root CA", "key": { "generate": "EC:prime256v1" },
+			"template": "no such template", "subject": { "CN": "t1" }, "days": 1 })"),
+		/* fails on an invalid extension after key generation */
+		QByteArray(R"({ "issuer": "Root CA", "key": { "generate": "EC:prime256v1" },
+			"subject": { "CN": "t2" }, "days": 1,
+			"extensions": { "keyUsage": "digitalSignatur" } })"),
+		/* fails writing output after the certificate is signed */
+		QString(R"({ "issuer": "Root CA", "key": { "generate": "EC:prime256v1" },
+			"subject": { "CN": "t3" }, "days": 1,
+			"output": { "cert": "%1/t3.pem", "key": "%2" } })")
+			.arg(dir.path(), unwritable).toUtf8(),
+	}) {
+		QVERIFY_EXCEPTION_THROWN(cli_certgen(jobFile(f7, failing)), errorEx);
+		QCOMPARE(Store.getAll<pki_key>().size(), keysBefore);
+		QCOMPARE(Store.getAll<pki_x509>().size(), certsBefore);
+	}
+	QVERIFY(!QFile::exists(dir.path() + "/t3.pem"));
+	XSqlQuery q;
+	SQL_PREPARE(q, "SELECT COUNT(*) FROM items WHERE del=0 AND name IN ('t1','t2','t3')");
+	q.exec();
+	QVERIFY(q.first());
+	QCOMPARE(q.value(0).toInt(), 0);
+
+	/* A renewal whose output fails is not stored either */
+	QTemporaryFile f8;
+	QVERIFY_EXCEPTION_THROWN(cli_certgen(jobFile(f8, QString(R"({ "renew": "%1",
+		"days": 1, "output": { "cert": "%2" } })")
+		.arg(cert->getSqlItemId().toString(), unwritable).toUtf8())), errorEx);
+	QCOMPARE(Store.getAll<pki_x509>().size(), certsBefore);
 
 	/* Invalid jobs are refused before anything is stored */
 	int before = Store.getAll<pki_x509>().size();
