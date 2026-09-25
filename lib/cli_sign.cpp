@@ -686,7 +686,7 @@ static void unlockDatabasePassword()
 	pki_evp::passwd = pass;
 }
 
-pki_x509 *cli_certgen(const QString &jsonfile)
+static pki_x509 *runJob(const QString &jsonfile)
 {
 	QFile file(jsonfile);
 	if (!file.open(QIODevice::ReadOnly))
@@ -705,14 +705,10 @@ pki_x509 *cli_certgen(const QString &jsonfile)
 	db_x509 *certs = Database.model<db_x509>();
 	db_key *keys = Database.model<db_key>();
 	jobResult r;
-	try {
-		if (job.contains("renew"))
-			renew(job, certs, r);
-		else
-			issue(job, certs, r);
-	} catch (enum open_result) {
-		throw errorEx(QObject::tr("Password input aborted"));
-	}
+	if (job.contains("renew"))
+		renew(job, certs, r);
+	else
+		issue(job, certs, r);
 
 	/* Every step that can fail runs before the database is written, so
 	 * a failed job stores nothing and leaves existing files untouched.
@@ -767,4 +763,19 @@ pki_x509 *cli_certgen(const QString &jsonfile)
 	}
 	qDeleteAll(staged);
 	return cert;
+}
+
+/* Password prompts abort by throwing enum open_result (the Windows
+ * console throws pw_exit when no password was given). The command line
+ * turns only errorEx into a failure exit status, so every abort in the
+ * job, including the database-password check and key decryption for
+ * output.key, is translated here. */
+pki_x509 *cli_certgen(const QString &jsonfile)
+{
+	try {
+		return runJob(jsonfile);
+	} catch (enum open_result) {
+		throw errorEx(QObject::tr("Password input aborted. Give the "
+			"database password with --password"));
+	}
 }

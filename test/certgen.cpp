@@ -20,6 +20,7 @@
 #include "lib/cli_sign.h"
 #include "lib/secure_file.h"
 #include "lib/sql.h"
+#include "lib/PwDialogCore.h"
 #include "lib/settings.h"
 #include "lib/BioByteArray.h"
 
@@ -289,6 +290,43 @@ void test_main::certgen()
 		QVERIFY2(p.waitForFinished(60000), "xca --certgen --import did not exit");
 		QCOMPARE(p.exitStatus(), QProcess::NormalExit);
 		QCOMPARE(p.exitCode(), 0);
+	}
+
+	/* A password prompt that aborts by throwing (the Windows console
+	 * path throws pw_exit) must reach the caller as errorEx, which the
+	 * command line turns into a failure exit status, whether it happens
+	 * at the database-password check or when a key is decrypted. */
+	{
+		struct ThrowingDialog : public PwDialogUI_i {
+			enum open_result execute(pass_info *, Passwd *, bool, bool)
+			{
+				throw pw_exit;
+			}
+		};
+		QTemporaryFile fp1, fp2;
+		QString j1 = jobFile(fp1, QString(R"({ "renew": "%1", "days": 1 })")
+				.arg(cert->getSqlItemId().toString()).toUtf8());
+		QString j2 = jobFile(fp2, QString(R"({ "renew": "%1", "days": 1,
+			"output": { "key": "%2/pw.pem" } })")
+				.arg(cert->getSqlItemId().toString(), dir.path()).toUtf8());
+		Passwd saved = pki_evp::passwd;
+		PwDialogCore::setGui(new ThrowingDialog());
+		int n0 = Store.getAll<pki_x509>().size();
+		for (const QString &j : { j1, j2 }) {
+			pki_evp::passwd = Passwd();
+			bool gotErrorEx = false;
+			try {
+				cli_certgen(j);
+			} catch (errorEx &) {
+				gotErrorEx = true;
+			} catch (...) {
+			}
+			QVERIFY2(gotErrorEx, "password abort escaped as a non-errorEx exception");
+		}
+		QCOMPARE(Store.getAll<pki_x509>().size(), n0);
+		pki_evp::passwd = saved;
+		pwdialog = new PwDialogMock();
+		PwDialogCore::setGui(pwdialog);
 	}
 
 	/* Invalid jobs are refused before anything is stored */
