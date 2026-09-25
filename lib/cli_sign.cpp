@@ -278,6 +278,11 @@ static void renew(const QJsonObject &job, db_x509 *certs, jobResult &r)
 struct extConf {
 	QString bc, ski, aki, ku, eku, nameCons, san, ian, crlDist, aia;
 	QString ocsp, nsCertType, nsComment, advanced;
+	QString nsBaseUrl, nsRevocationUrl, nsCARevocationUrl, nsRenewalUrl;
+	QString nsCaPolicyUrl, nsSslServerName;
+	/* NIDs the job set to "" explicitly: omitted here and not copied
+	 * back in from a request. */
+	QSet<int> removed;
 };
 
 static QString kuFromBits(int bits, bool critical)
@@ -336,29 +341,38 @@ static void fromTemplate(extConf &c, pki_temp *t)
 	c.ocsp = t->getSettingInt("OCSPstaple") ? "status_request" : "";
 	c.nsCertType = nsCertTypeFromBits(t->getSettingInt("nsCertType"));
 	c.nsComment = t->getSetting("nsComment");
+	c.nsBaseUrl = t->getSetting("nsBaseUrl");
+	c.nsRevocationUrl = t->getSetting("nsRevocationUrl");
+	c.nsCARevocationUrl = t->getSetting("nsCARevocationUrl");
+	c.nsRenewalUrl = t->getSetting("nsRenewalUrl");
+	c.nsCaPolicyUrl = t->getSetting("nsCaPolicyUrl");
+	c.nsSslServerName = t->getSetting("nsSslServerName");
 	c.advanced = t->getSetting("adv_ext");
 }
 
 static void fromJson(extConf &c, const QJsonObject &e)
 {
 	rejectUnknown(e, ext_keys, "'extensions'");
-	struct { const char *key; QString *dst; } map[] = {
-		{ "basicConstraints", &c.bc },
-		{ "subjectKeyIdentifier", &c.ski },
-		{ "authorityKeyIdentifier", &c.aki },
-		{ "keyUsage", &c.ku },
-		{ "extendedKeyUsage", &c.eku },
-		{ "nameConstraints", &c.nameCons },
-		{ "subjectAltName", &c.san },
-		{ "issuerAltName", &c.ian },
-		{ "crlDistributionPoints", &c.crlDist },
-		{ "authorityInfoAccess", &c.aia },
-		{ "nsComment", &c.nsComment },
-		{ "advanced", &c.advanced },
+	struct { const char *key; QString *dst; int nid; } map[] = {
+		{ "basicConstraints", &c.bc, NID_basic_constraints },
+		{ "subjectKeyIdentifier", &c.ski, NID_subject_key_identifier },
+		{ "authorityKeyIdentifier", &c.aki, NID_authority_key_identifier },
+		{ "keyUsage", &c.ku, NID_key_usage },
+		{ "extendedKeyUsage", &c.eku, NID_ext_key_usage },
+		{ "nameConstraints", &c.nameCons, NID_name_constraints },
+		{ "subjectAltName", &c.san, NID_subject_alt_name },
+		{ "issuerAltName", &c.ian, NID_issuer_alt_name },
+		{ "crlDistributionPoints", &c.crlDist, NID_crl_distribution_points },
+		{ "authorityInfoAccess", &c.aia, NID_info_access },
+		{ "nsComment", &c.nsComment, NID_netscape_comment },
+		{ "advanced", &c.advanced, NID_undef },
 	};
 	for (auto &m : map) {
-		if (e.contains(m.key))
-			*m.dst = e[m.key].toString();
+		if (!e.contains(m.key))
+			continue;
+		*m.dst = e[m.key].toString();
+		if (m.dst->isEmpty() && m.nid != NID_undef)
+			c.removed << m.nid;
 	}
 }
 
@@ -419,8 +433,30 @@ static void applyExtensions(const extConf &c, X509V3_CTX *ctx)
 	addExt(NID_tlsfeature, c.ocsp, ctx);
 	applyAdvanced(c.advanced, ctx);
 	if (!Settings["disable_netscape"]) {
+		/* the same set and order as NewX509::getNetscapeExt() */
 		addExt(NID_netscape_cert_type, c.nsCertType, ctx);
+		addExt(NID_netscape_base_url, c.nsBaseUrl, ctx, true);
+		addExt(NID_netscape_revocation_url, c.nsRevocationUrl, ctx, true);
+		addExt(NID_netscape_ca_revocation_url, c.nsCARevocationUrl, ctx, true);
+		addExt(NID_netscape_renewal_url, c.nsRenewalUrl, ctx, true);
+		addExt(NID_netscape_ca_policy_url, c.nsCaPolicyUrl, ctx, true);
+		addExt(NID_netscape_ssl_server_name, c.nsSslServerName, ctx, true);
 		addExt(NID_netscape_comment, c.nsComment, ctx, true);
+	}
+}
+
+/* RFC 5280 allows each extension once. The named fields, the template,
+ * "advanced" and the request can each supply one; the GUI refuses the
+ * same collision in NewX509::validateExtensions(). */
+static void checkDuplicateExtensions(const pki_x509 *cert)
+{
+	extList el = cert->getV3ext();
+	QSet<int> seen;
+	for (const x509v3ext &e : el) {
+		if (seen.contains(e.nid()))
+			throw errorEx(QObject::tr("Extension '%1' is given more than "
+				"once").arg(OBJ_nid2ln(e.nid())));
+		seen << e.nid();
 	}
 }
 
@@ -600,9 +636,12 @@ static void issue(const QJsonObject &job, db_x509 *certs, jobResult &r)
 
 		if (req && job["copy_csr_extensions"].toBool(true)) {
 			extList el = req->getV3ext();
-			for (int i = 0; i < el.count(); i++)
-				cert->addV3ext(el[i], true);
+			for (int i = 0; i < el.count(); i++) {
+				if (!conf.removed.contains(el[i].nid()))
+					cert->addV3ext(el[i], true);
+			}
 		}
+		checkDuplicateExtensions(cert);
 
 		checkNameConstraints(cert, issuer);
 

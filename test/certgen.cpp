@@ -21,6 +21,8 @@
 #include "lib/secure_file.h"
 #include "lib/sql.h"
 #include "lib/PwDialogCore.h"
+#include "lib/db_temp.h"
+#include "lib/pki_temp.h"
 #include "lib/settings.h"
 #include "lib/BioByteArray.h"
 
@@ -192,6 +194,47 @@ void test_main::certgen()
 	QTemporaryFile f5, f6;
 	QVERIFY(cli_certgen(jobFile(f5, QString(R"({ "issuer": "Root CA",
 		"csr": "%1", "days": 1 })").arg(good->getSqlItemId().toString()).toUtf8())));
+
+	/* Extension merging: an explicit empty-string removal is not undone
+	 * by the CSR copy, and one extension from two sources is refused. */
+	{
+		x509name csrName;
+		csrName.addEntryByNid(NID_commonName, "sans.example.net");
+		extList reqExt;
+		x509v3ext e;
+		reqExt << e.create(NID_subject_alt_name, "DNS:sans.example.net");
+		reqExt << e.create(NID_basic_constraints, "CA:TRUE");
+		pki_x509req *withExt = new pki_x509req("csr-with-ext");
+		withExt->createReq(subjectKey, csrName, digest::getDefault(), reqExt);
+		withExt = dynamic_cast<pki_x509req*>(Database.model<db_x509req>()->insert(withExt));
+		QVERIFY(withExt && withExt->getV3ext().count() == 2);
+		QTemporaryFile fe1, fe2, fe3;
+		pki_x509 *noSan = cli_certgen(jobFile(fe1, QString(R"({ "issuer": "Root CA",
+			"csr": "%1", "days": 1, "extensions": { "subjectAltName": "",
+			"basicConstraints": "critical, CA:FALSE" } })")
+			.arg(withExt->getSqlItemId().toString()).toUtf8()));
+		QVERIFY(noSan);
+		QCOMPARE(extCount(noSan, NID_subject_alt_name), 0);
+		QCOMPARE(extCount(noSan, NID_basic_constraints), 1);
+		QVERIFY(!noSan->isCA());
+		int nDup = Store.getAll<pki_x509>().size();
+		QVERIFY_EXCEPTION_THROWN(cli_certgen(jobFile(fe2, QString(R"({
+			"issuer": "Root CA", "key": "%1", "days": 1, "subject": { "CN": "dup" },
+			"extensions": { "subjectKeyIdentifier": "hash",
+			"advanced": "subjectKeyIdentifier = hash\n" } })").arg(keyId).toUtf8())), errorEx);
+		QCOMPARE(Store.getAll<pki_x509>().size(), nDup);
+		/* the template's Netscape URL fields reach the certificate */
+		pki_temp *nst = new pki_temp("ns template");
+		nst->setSetting("nsRevocationUrl", "http://crl.example/rev");
+		nst->setSetting("ca", 2);
+		nst = dynamic_cast<pki_temp*>(Database.model<db_temp>()->insert(nst));
+		QVERIFY(nst);
+		pki_x509 *nsc = cli_certgen(jobFile(fe3, QString(R"({ "issuer": "Root CA",
+			"key": "%1", "template": "%2", "days": 1, "subject": { "CN": "ns" } })")
+			.arg(keyId, nst->getSqlItemId().toString()).toUtf8()));
+		QVERIFY(nsc);
+		QCOMPARE(extCount(nsc, NID_netscape_revocation_url), 1);
+	}
 	int nCsr = Store.getAll<pki_x509>().size();
 	QVERIFY_EXCEPTION_THROWN(cli_certgen(jobFile(f6, QString(R"({ "issuer": "Root CA",
 		"csr": "%1", "days": 1 })").arg(tampered->getSqlItemId().toString()).toUtf8())), errorEx);
