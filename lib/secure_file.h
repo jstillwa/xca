@@ -20,9 +20,12 @@
  *
  * With owner_only, the temporary file is created readable by the current
  * user only (mode 0600; on Windows a protected DACL granting OWNER RIGHTS
- * only, so ACEs inherited from the folder never apply), and commit()
- * verifies the published file. Renaming replaces an existing destination
- * instead of reusing its permissions. */
+ * only, so ACEs inherited from the folder never apply). The empty file
+ * is checked before writing, and commit() checks the staged permissions
+ * again before replacing and verifies the published file. The open file
+ * handle remains available to restore its permissions if that last check
+ * fails. Renaming replaces an existing destination instead of reusing its
+ * permissions. */
 class staged_file
 {
   public:
@@ -35,6 +38,11 @@ class staged_file
   private:
 	QString dest{}, tmp{};
 	bool owner_only{}, done{};
+#if defined(Q_OS_WIN32)
+	void *file_handle{};
+#else
+	int file_descriptor{-1};
+#endif
 };
 
 /* Stage and commit in one call. */

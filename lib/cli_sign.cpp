@@ -103,8 +103,8 @@ static a1time parseTime(const QJsonValue &v, const char *key)
 {
 	a1time t;
 	QDateTime dt = QDateTime::fromString(v.toString(), Qt::ISODate);
-	if (!dt.isValid())
-		throw errorEx(QObject::tr("Invalid ISO-8601 date in '%1': %2")
+	if (!dt.isValid() || dt.toSecsSinceEpoch() == 0)
+		throw errorEx(QObject::tr("Invalid or undefined ISO-8601 date in '%1': %2")
 				.arg(key).arg(v.toString()));
 	t = a1time(dt.toUTC());
 	return t;
@@ -202,6 +202,8 @@ static void validateJob(const QJsonObject &job, const QString &file)
 /* notBefore must precede notAfter; the GUI warns about the same case. */
 static void checkInterval(const a1time &nb, const a1time &na)
 {
+	if (nb.isUndefined())
+		throw errorEx(QObject::tr("The start date cannot be the undefined epoch date"));
 	if (!na.isUndefined() && na <= nb)
 		throw errorEx(QObject::tr("The certificate would expire (%1) "
 			"before it becomes valid (%2)")
@@ -218,7 +220,23 @@ struct jobResult {
 	pki_x509req *req{};      /* request to mark as signed */
 };
 
+static void checkSubject(const x509name &subject)
+{
+	QString lengthError = subject.checkLength();
+	if (!lengthError.isEmpty())
+		throw errorEx(QObject::tr("Subject length restrictions are violated: %1")
+			.arg(lengthError));
+	for (const QString &field : QString(Settings["mandatory_dn"]).split(",", Qt::SkipEmptyParts)) {
+		int nid = OBJ_txt2nid(CCHAR(field.trimmed()));
+		if (nid != NID_undef && subject.getEntryByNid(nid).isEmpty())
+			throw errorEx(QObject::tr("Mandatory subject field '%1' is missing")
+				.arg(field));
+	}
+}
+
 static void checkNameConstraints(pki_x509 *cert, pki_x509 *issuer);
+static void checkSignerValidity(const a1time &nb, const a1time &na,
+			pki_x509 *issuer);
 
 static void renew(const QJsonObject &job, db_x509 *certs, jobResult &r)
 {
@@ -261,9 +279,18 @@ static void renew(const QJsonObject &job, db_x509 *certs, jobResult &r)
 		cert->setSerial(job["keep_serial"].toBool() ?
 			old->getSerial() : certs->getUniqueSerial(signer));
 		checkInterval(notBefore, notAfter);
+		if (notAfter.isUndefined() &&
+				(job.contains("days") || !old->getNotAfter().isUndefined()))
+			throw errorEx(QObject::tr("The calculated expiry aliases the undefined epoch date"));
 		cert->setNotBefore(notBefore);
 		cert->setNotAfter(notAfter);
+		checkSubject(cert->getSubject());
+		if (cert->getV3ext().isEmpty())
+			throw errorEx(QObject::tr("The certificate contains no extensions"));
+		checkSignerValidity(notBefore, notAfter, signer);
 		checkNameConstraints(cert, signer);
+		if (old->getDigest().isInsecure())
+			throw errorEx(QObject::tr("The renewal signature hash is insecure"));
 		cert->sign(signkey, old->getDigest());
 	} catch (...) {
 		delete cert;
@@ -446,6 +473,38 @@ static void applyExtensions(const extConf &c, X509V3_CTX *ctx)
 	}
 }
 
+/* An explicit empty JSON extension is authoritative over every source,
+ * including the template's advanced config and a copied CSR. Filter by
+ * NID on the finished certificate, leaving unrelated OIDs intact. */
+static void removeExtensions(pki_x509 *cert, const QSet<int> &removed)
+{
+	for (int nid : removed) {
+		int idx;
+		while ((idx = X509_get_ext_by_NID(cert->getCert(), nid, -1)) >= 0)
+			X509_EXTENSION_free(X509_delete_ext(cert->getCert(), idx));
+	}
+}
+
+/* Named SAN fields already expand DNS:copycn through x509v3ext::create.
+ * Advanced config and CSR extensions can carry the literal token; expand
+ * it against the final subject, or refuse if there is no common name. */
+static void resolveCopyCn(pki_x509 *cert, X509V3_CTX *ctx)
+{
+	int idx = X509_get_ext_by_NID(cert->getCert(), NID_subject_alt_name, -1);
+	if (idx < 0)
+		return;
+	x509v3ext san(X509_get_ext(cert->getCert(), idx));
+	QString value = san.getValue();
+	if (!value.contains("DNS:copycn"))
+		return;
+	QString cn = cert->getSubject().getEntryByNid(NID_commonName);
+	if (cn.isEmpty())
+		throw errorEx(QObject::tr("DNS:copycn requires a common name"));
+	X509_EXTENSION_free(X509_delete_ext(cert->getCert(), idx));
+	value.replace("DNS:copycn", "DNS:" + cn);
+	addExt(NID_subject_alt_name, san.getCritical() ? "critical, " + value : value, ctx);
+}
+
 /* RFC 5280 allows each extension once. The named fields, the template,
  * "advanced" and the request can each supply one; the GUI refuses the
  * same collision in NewX509::validateExtensions(). */
@@ -566,9 +625,15 @@ static pki_evp *generateKey(const QJsonObject &k, const QJsonObject &job)
 static digest signingDigest(const QJsonObject &job, pki_key *signkey)
 {
 	QList<int> ok = signkey->possibleHashNids();
+	if (ok.isEmpty())
+		throw errorEx(QObject::tr("The CA key has no supported signature hashes"));
 	if (!job.contains("hash")) {
 		digest md = digest::getDefault();
+		if (md.isInsecure())
+			throw errorEx(QObject::tr("The configured signature hash is insecure"));
 		md.adjust(ok);
+		if (md.isInsecure())
+			throw errorEx(QObject::tr("The CA key only offers an insecure signature hash"));
 		return md;
 	}
 	QString h = job["hash"].toString();
@@ -584,7 +649,23 @@ static digest signingDigest(const QJsonObject &job, pki_key *signkey)
 	if (!ok.contains(md.MD() ? EVP_MD_type(md.MD()) : NID_undef))
 		throw errorEx(QObject::tr("The %1 CA key cannot sign with %2")
 			.arg(signkey->getTypeString()).arg(h));
+	if (md.isInsecure())
+		throw errorEx(QObject::tr("The signature hash '%1' is insecure").arg(h));
 	return md;
+}
+
+static void checkSignerValidity(const a1time &nb, const a1time &na,
+			pki_x509 *issuer)
+{
+	/* X.509 encodes whole seconds; comparing QDateTime milliseconds
+	 * would wrongly reject a certificate with the same encoded expiry. */
+	if (nb.toSecsSinceEpoch() < issuer->getNotBefore().toSecsSinceEpoch() ||
+			(!na.isUndefined() && !issuer->getNotAfter().isUndefined() &&
+			 na.toSecsSinceEpoch() > issuer->getNotAfter().toSecsSinceEpoch()))
+		throw errorEx(QObject::tr("Certificate validity [%1, %2] exceeds signer '%3' validity [%4, %5]")
+			.arg(nb.toPlain()).arg(na.toPlain()).arg(issuer->getIntName())
+			.arg(issuer->getNotBefore().toPlain())
+			.arg(issuer->getNotAfter().toPlain()));
 }
 
 static void checkNameConstraints(pki_x509 *cert, pki_x509 *issuer)
@@ -640,6 +721,7 @@ static void issue(const QJsonObject &job, db_x509 *certs, jobResult &r)
 			subj = mergeSubject(subj, js);
 		if (subj.entryCount() == 0)
 			throw errorEx(QObject::tr("Empty subject"));
+		checkSubject(subj);
 
 		QString name = job["name"].toString();
 		if (name.isEmpty())
@@ -665,8 +747,12 @@ static void issue(const QJsonObject &job, db_x509 *certs, jobResult &r)
 			throw errorEx(QObject::tr("Give 'days', 'not_after' "
 					"or a 'template'"));
 		checkInterval(nb, na);
+		if (na.isUndefined() && !(temp &&
+				temp->getSettingInt("noWellDefinedExpDate")))
+			throw errorEx(QObject::tr("The calculated expiry aliases the undefined epoch date"));
 		cert->setNotBefore(nb);
 		cert->setNotAfter(na);
+		checkSignerValidity(nb, na, issuer);
 
 		extConf conf;
 		if (temp)
@@ -686,7 +772,11 @@ static void issue(const QJsonObject &job, db_x509 *certs, jobResult &r)
 					cert->addV3ext(el[i], true);
 			}
 		}
+		removeExtensions(cert, conf.removed);
+		resolveCopyCn(cert, &ctx);
 		checkDuplicateExtensions(cert);
+		if (cert->getV3ext().isEmpty())
+			throw errorEx(QObject::tr("The certificate contains no extensions"));
 
 		checkNameConstraints(cert, issuer);
 

@@ -10,6 +10,9 @@
 #include <QTemporaryDir>
 #include <QProcess>
 #include <QCoreApplication>
+#include <QDir>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <openssl/pem.h>
 
 #include "lib/pki_multi.h"
@@ -27,6 +30,12 @@
 #include "lib/BioByteArray.h"
 
 #include "main.h"
+
+#if defined(Q_OS_WIN32)
+/* Inject a permissive DACL on a synthetic, already-staged file. */
+#include <windows.h>
+#include <sddl.h>
+#endif
 
 static QString jobFile(QTemporaryFile &f, const QByteArray &json)
 {
@@ -46,8 +55,539 @@ static int extCount(pki_x509 *cert, int nid)
 	return n;
 }
 
+/* Each red row has an isolated temporary XCA test database and does not
+ * depend on the legacy certgen() test running first. */
+QPair<QString, QString> test_main::certgenRedFixture(bool renewal)
+{
+	ign_openssl_error();
+	openDB();
+	Settings["suppress_messages"] = true;
+	pki_multi *pem = new pki_multi();
+	pem->fromPEMbyteArray(pemdata["Root CA"].toUtf8(), QString());
+	pem->fromPEMbyteArray(pemdata["Root CA Key"].toUtf8(), QString());
+	pem->fromPEMbyteArray(pemdata["Endentity Key"].toUtf8(), QString());
+	Database.insert(pem);
+	pki_x509 *root = dynamic_cast<pki_x509*>(
+		Database.model<db_x509>()->getByName("Root CA"));
+	if (!root)
+		throw errorEx("Red test fixture has no root CA");
+	QString keyId;
+	for (pki_key *key : Store.getAll<pki_key>())
+		if (key != root->getRefKey())
+			keyId = key->getSqlItemId().toString();
+	if (keyId.isEmpty())
+		throw errorEx("Red test fixture has no subject key");
+	QString renewId;
+	if (renewal) {
+		QTemporaryFile f;
+		pki_x509 *seed = cli_certgen(jobFile(f, QString(R"({
+			"issuer":"Root CA", "key":"%1", "days":30,
+			"subject":{"CN":"seed.example"},
+			"extensions":{"keyUsage":"digitalSignature"}})").arg(keyId).toUtf8()));
+		if (!seed)
+			throw errorEx("Red test fixture could not issue a renewal seed");
+		renewId = seed->getSqlItemId().toString();
+	}
+	return { keyId, renewId };
+}
+
+static QString issueJob(const QString &key, const QJsonObject &fields)
+	{
+		QJsonObject job = fields;
+		job["issuer"] = "Root CA";
+		job["key"] = key;
+		job["days"] = 1;
+		if (!job.contains("subject"))
+			job["subject"] = QJsonObject{ { "CN", "red.example" } };
+		if (!job.contains("extensions"))
+			job["extensions"] = QJsonObject{ { "keyUsage", "digitalSignature" } };
+		return QString::fromUtf8(QJsonDocument(job).toJson(QJsonDocument::Compact));
+	}
+
+static pki_x509 *run(const QString &job)
+	{
+		QTemporaryFile f;
+		return cli_certgen(jobFile(f, job.toUtf8()));
+	}
+
+static bool refused(const QString &job)
+	{
+		try {
+			run(job);
+		} catch (errorEx &) {
+			return true;
+		}
+		return false;
+	}
+
+void test_main::ownerOnlyProtection_data()
+	{
+		QTest::addColumn<bool>("existing");
+		QTest::newRow("new-destination") << false;
+		QTest::newRow("existing-destination") << true;
+	}
+
+void test_main::ownerOnlyProtection()
+	{
+#if defined(Q_OS_WIN32)
+		QFETCH(bool, existing);
+		QTemporaryDir dir;
+		QVERIFY(dir.isValid());
+		QString dest = dir.filePath("synthetic-key.pem");
+		if (existing) {
+			QFile prior(dest);
+			QVERIFY(prior.open(QIODevice::WriteOnly));
+			QCOMPARE(prior.write("previous-synthetic-marker"), qint64(QByteArray("previous-synthetic-marker").size()));
+			prior.close();
+		}
+		staged_file staged(dest, "synthetic-non-secret-marker", true);
+		QStringList tmp = QDir(dir.path()).entryList(
+			{ "synthetic-key.pem.*.tmp" }, QDir::Files);
+		QCOMPARE(tmp.size(), 1);
+		QString path = dir.filePath(tmp.first());
+		QVERIFY(is_owner_only_file(path));
+		PSECURITY_DESCRIPTOR sd = NULL;
+		QVERIFY(ConvertStringSecurityDescriptorToSecurityDescriptorW(
+			L"D:P(A;;FA;;;WD)", SDDL_REVISION_1, &sd, NULL));
+		BOOL applied = SetFileSecurityW(QDir::toNativeSeparators(path).toStdWString().c_str(),
+			DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION, sd);
+		LocalFree(sd);
+		QVERIFY(applied);
+		QVERIFY2(!is_owner_only_file(path), "the test must actually make the staged ACL permissive");
+		bool rejected = false;
+		try {
+			staged.commit();
+		} catch (errorEx &) {
+			rejected = true;
+		}
+		QVERIFY2(rejected, "secret publication accepted a staged file with an insecure DACL");
+		if (existing) {
+			QFile prior(dest);
+			QVERIFY(prior.open(QIODevice::ReadOnly));
+			QCOMPARE(prior.readAll(), QByteArray("previous-synthetic-marker"));
+		} else {
+			QVERIFY2(!QFile::exists(dest), "failed publication left a plaintext destination");
+		}
+#else
+		QFETCH(bool, existing);
+		QTemporaryDir dir;
+		QVERIFY(dir.isValid());
+		QString dest = dir.filePath("synthetic-key.pem");
+		if (existing) {
+			QFile prior(dest);
+			QVERIFY(prior.open(QIODevice::WriteOnly));
+			QCOMPARE(prior.write("previous-synthetic-marker"), qint64(QByteArray("previous-synthetic-marker").size()));
+		}
+		staged_file staged(dest, "synthetic-non-secret-marker", true);
+		QStringList tmp = QDir(dir.path()).entryList(
+			{ "synthetic-key.pem.*.tmp" }, QDir::Files);
+		QCOMPARE(tmp.size(), 1);
+		QString path = dir.filePath(tmp.first());
+		QVERIFY(is_owner_only_file(path));
+		QVERIFY(QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner |
+			QFile::ReadGroup | QFile::ReadOther));
+		QVERIFY2(!is_owner_only_file(path), "the test must actually make the staged mode permissive");
+		bool rejected = false;
+		try {
+			staged.commit();
+		} catch (errorEx &) {
+			rejected = true;
+		}
+		QVERIFY2(rejected, "secret publication accepted a staged file with insecure mode bits");
+		if (existing) {
+			QFile prior(dest);
+			QVERIFY(prior.open(QIODevice::ReadOnly));
+			QCOMPARE(prior.readAll(), QByteArray("previous-synthetic-marker"));
+		} else {
+			QVERIFY2(!QFile::exists(dest), "failed publication left a plaintext destination");
+		}
+#endif
+	}
+
+void test_main::extensionRemoval_data()
+	{
+		QTest::addColumn<QString>("field");
+		QTest::addColumn<QString>("advanced");
+		QTest::addColumn<int>("nid");
+		QTest::addColumn<bool>("inTemplate");
+		QTest::newRow("template-advanced-basicConstraints") << QString("basicConstraints") << QString("basicConstraints = CA:TRUE\n") << NID_basic_constraints << true;
+		QTest::newRow("template-advanced-subjectAltName") << QString("subjectAltName") << QString("subjectAltName = DNS:unwanted.example\n") << NID_subject_alt_name << true;
+		QTest::newRow("template-advanced-keyUsage") << QString("keyUsage") << QString("keyUsage = digitalSignature\n") << NID_key_usage << true;
+		QTest::newRow("json-advanced-basicConstraints") << QString("basicConstraints") << QString("basicConstraints = CA:TRUE\n") << NID_basic_constraints << false;
+		QTest::newRow("template-named-subjectAltName") << QString("subjectAltName") << QString("named") << NID_subject_alt_name << true;
+	}
+
+void test_main::extensionRemoval()
+	{
+		QFETCH(QString, field);
+		QFETCH(QString, advanced);
+		QFETCH(int, nid);
+		QFETCH(bool, inTemplate);
+		QString keyId = certgenRedFixture().first;
+		QVERIFY(!keyId.isEmpty());
+		QJsonObject extensions{ {field, ""} };
+		QJsonObject fields;
+		/* A forbidden OID and an unrelated advanced OID must be treated
+		 * independently, never by dropping all advanced extensions. */
+		const QString sibling = "extendedKeyUsage = serverAuth\n";
+		if (advanced == "named")
+			extensions["keyUsage"] = "digitalSignature";
+		if (inTemplate) {
+			pki_temp *t = new pki_temp("red advanced removal");
+			t->setSetting("ca", 0);
+			if (advanced == "named")
+				t->setSetting("subAltName", "DNS:removed.example");
+			else
+				t->setSetting("adv_ext", advanced + sibling);
+			t = dynamic_cast<pki_temp*>(Database.model<db_temp>()->insert(t));
+			QVERIFY(t);
+			fields["template"] = t->getSqlItemId().toString();
+		} else {
+			extensions["advanced"] = advanced + sibling;
+		}
+		fields["extensions"] = extensions;
+		pki_x509 *signedCert = run(issueJob(keyId, fields));
+		QVERIFY(signedCert);
+		QCOMPARE(extCount(signedCert, nid), 0);
+		if (advanced != "named")
+			QCOMPARE(extCount(signedCert, NID_ext_key_usage), 1);
+		else
+			QCOMPARE(extCount(signedCert, NID_key_usage), 1);
+	}
+
+void test_main::extensionRemovalCsr()
+	{
+		QString keyId = certgenRedFixture().first;
+		pki_key *subjectKey = Store.lookupPki<pki_key>(QVariant(keyId.toULongLong()));
+		QVERIFY(subjectKey);
+		x509name subject;
+		subject.addEntryByNid(NID_commonName, "csr-removal.example");
+		extList reqExt;
+		x509v3ext e;
+		reqExt << e.create(NID_subject_alt_name, "DNS:removed.example");
+		reqExt << e.create(NID_key_usage, "digitalSignature");
+		pki_x509req *req = new pki_x509req("red-csr-siblings");
+		req->createReq(subjectKey, subject, digest::getDefault(), reqExt);
+		req = dynamic_cast<pki_x509req*>(Database.model<db_x509req>()->insert(req));
+		QVERIFY(req);
+		QJsonObject fields{ { "issuer", "Root CA" },
+			{ "csr", req->getSqlItemId().toString() }, { "days", 1 },
+			{ "extensions", QJsonObject{ { "subjectAltName", "" } } } };
+		pki_x509 *signedCert = run(QString::fromUtf8(QJsonDocument(fields).toJson(QJsonDocument::Compact)));
+		QVERIFY(signedCert);
+		QCOMPARE(extCount(signedCert, NID_subject_alt_name), 0);
+		QCOMPARE(extCount(signedCert, NID_key_usage), 1);
+	}
+
+void test_main::credentialExit_data()
+	{
+		QTest::addColumn<QString>("option");
+		QTest::addColumn<QString>("source");
+		for (const QString &option : { QString("password"), QString("sqlpass") }) {
+			QTest::newRow(qPrintable(option + "-bad-fd")) << option << QString("fd:-1");
+			QTest::newRow(qPrintable(option + "-missing-file")) << option << QString("file:missing-credential-red-source");
+		}
+		QTest::newRow("database-open-error") << QString("database") << QString();
+	}
+
+void test_main::credentialExit()
+	{
+		QFETCH(QString, option);
+		QFETCH(QString, source);
+		QTemporaryDir dir;
+		QVERIFY(dir.isValid());
+		QTemporaryFile f;
+		QString job = jobFile(f, QByteArray(R"({"renew":"999999"})"));
+		QProcess p;
+		QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+		env.insert("XCA_NO_GUI", "1");
+		env.insert("XCA_RED_PROBE_PASSWORD", "red-credential-must-not-be-printed");
+		p.setProcessEnvironment(env);
+		QString exe = QCoreApplication::applicationDirPath() + "/xca";
+#if defined(Q_OS_WIN32)
+		exe += ".exe";
+#endif
+		QString db = dir.filePath("nonexistent.xdb");
+		QStringList args;
+		if (option == "database") {
+			db = dir.filePath("directory-instead-of-database");
+			QVERIFY(QDir().mkpath(db));
+			args << "--password=env:XCA_RED_PROBE_PASSWORD";
+		} else {
+			if (source.startsWith("file:"))
+				source = "file:" + dir.filePath("missing-credential-source");
+			args << "--" + option + "=" + source;
+		}
+		p.start(exe, QStringList{ "--database=" + db, "--certgen=" + job } + args);
+		QVERIFY(p.waitForStarted(10000));
+		if (!p.waitForFinished(20000)) {
+			p.kill();
+			p.waitForFinished(5000);
+			QFAIL("credential-source subprocess timed out");
+		}
+		QCOMPARE(p.exitStatus(), QProcess::NormalExit);
+		QVERIFY2(p.exitCode() != 0, "pre-job failure returned console success");
+		QByteArray diagnostic = p.readAllStandardError() + p.readAllStandardOutput();
+		QVERIFY2(!diagnostic.contains("red-credential-must-not-be-printed"),
+			"pre-job error leaked the credential value");
+		if (option == "database") {
+			QVERIFY2(diagnostic.contains("database") || diagnostic.contains("Database"),
+				"database-open error lacks a database-specific diagnostic");
+		} else {
+			bool passwordDiagnostic = diagnostic.contains("password") || diagnostic.contains("Password");
+			QVERIFY2(passwordDiagnostic || (source.startsWith("file:") &&
+				diagnostic.contains("Error opening file:")),
+				"credential-source error lacks a password or file-open diagnostic");
+			QVERIFY(!QFile::exists(db));
+		}
+	}
+
+void test_main::epochValidity_data()
+	{
+		QTest::addColumn<bool>("renew");
+		QTest::addColumn<QString>("before");
+		QTest::addColumn<QString>("after");
+		QTest::addColumn<int>("days");
+		QTest::addColumn<bool>("reject");
+		for (bool renew : { false, true }) {
+			QString mode = renew ? "renew-" : "issue-";
+			QTest::newRow(qPrintable(mode + "before-epoch")) << renew << QString("1970-01-01T01:00:00+01:00") << QString() << 1 << true;
+			QTest::newRow(qPrintable(mode + "after-epoch")) << renew << QString("1969-12-30T00:00:00Z") << QString("1970-01-01T00:00:00Z") << 0 << true;
+			QTest::newRow(qPrintable(mode + "calculated-epoch")) << renew << QString("1969-12-31T00:00:00Z") << QString() << 1 << true;
+			QTest::newRow(qPrintable(mode + "ordinary-validity")) << renew << QString("2031-01-01T00:00:00Z") << QString() << 1 << false;
+		}
+	}
+
+void test_main::epochValidity()
+	{
+		QFETCH(bool, renew);
+		QFETCH(QString, before);
+		QFETCH(QString, after);
+		QFETCH(int, days);
+		QFETCH(bool, reject);
+		QPair<QString, QString> fixture = certgenRedFixture(renew);
+		QString keyId = fixture.first;
+		QString renewId = fixture.second;
+		QVERIFY(!keyId.isEmpty());
+		QJsonObject job;
+		job["not_before"] = before;
+		if (!after.isEmpty())
+			job["not_after"] = after;
+		else
+			job["days"] = days;
+		if (renew)
+			job["renew"] = renewId;
+		else {
+			job["issuer"] = "Root CA";
+			job["key"] = keyId;
+			job["subject"] = QJsonObject{ { "CN", "epoch.example" } };
+			job["extensions"] = QJsonObject{ { "keyUsage", "digitalSignature" } };
+		}
+		QString json = QString::fromUtf8(QJsonDocument(job).toJson(QJsonDocument::Compact));
+		int n = Store.getAll<pki_x509>().size();
+		if (reject) {
+			QVERIFY2(refused(json), "epoch-zero timestamp was accepted instead of refused");
+			QCOMPARE(Store.getAll<pki_x509>().size(), n);
+		} else {
+			pki_x509 *signedCert = run(json);
+			QVERIFY(signedCert);
+			QCOMPARE(signedCert->getNotBefore().toPlain(), QString("20310101000000Z"));
+			QCOMPARE(signedCert->getNotAfter().toPlain(), QString("20310102000000Z"));
+		}
+	}
+
+void test_main::copyCn_data()
+	{
+		QTest::addColumn<bool>("useTemplate");
+		QTest::addColumn<QString>("cn");
+		QTest::addColumn<bool>("explicitEmpty");
+		for (bool tmpl : { false, true }) {
+			QString mode = tmpl ? "template-" : "json-";
+			QTest::newRow(qPrintable(mode + "missing-cn")) << tmpl << QString() << false;
+			QTest::newRow(qPrintable(mode + "cleared-cn")) << tmpl << QString() << true;
+			QTest::newRow(qPrintable(mode + "present-cn")) << tmpl << QString("good.example") << false;
+		}
+	}
+
+void test_main::copyCn()
+	{
+		QFETCH(bool, useTemplate);
+		QFETCH(QString, cn);
+		QFETCH(bool, explicitEmpty);
+		QString keyId = certgenRedFixture().first;
+		QVERIFY(!keyId.isEmpty());
+		QJsonObject fields;
+		QJsonObject subject{ { "O", "Red test" } };
+		if (!cn.isEmpty() || explicitEmpty)
+			subject["CN"] = cn;
+		fields["subject"] = subject;
+		if (useTemplate) {
+			pki_temp *t = new pki_temp("red copycn template");
+			t->setSetting("ca", 0);
+			t->setSetting("subAltName", "DNS:copycn");
+			t = dynamic_cast<pki_temp*>(Database.model<db_temp>()->insert(t));
+			QVERIFY(t);
+			fields["template"] = t->getSqlItemId().toString();
+		} else {
+			fields["extensions"] = QJsonObject{ { "subjectAltName", "DNS:copycn" } };
+		}
+		QString json = issueJob(keyId, fields);
+		int n = Store.getAll<pki_x509>().size();
+		if (cn.isEmpty()) {
+			QVERIFY2(refused(json), "DNS:copycn with no common name was signed literally");
+			QCOMPARE(Store.getAll<pki_x509>().size(), n);
+		} else {
+			pki_x509 *signedCert = run(json);
+			QVERIFY(signedCert);
+			QCOMPARE(extCount(signedCert, NID_subject_alt_name), 1);
+			extList extensions = signedCert->getV3ext();
+			QVERIFY(extensions[extensions.idxByNid(NID_subject_alt_name)].getValue().contains("DNS:good.example"));
+		}
+	}
+
+void test_main::copyCnOtherSources_data()
+	{
+		QTest::addColumn<QString>("source");
+		QTest::addColumn<bool>("presentCn");
+		for (const QString &source : { QString("advanced"), QString("csr") }) {
+			QTest::newRow(qPrintable(source + "-missing-cn")) << source << false;
+			QTest::newRow(qPrintable(source + "-present-cn")) << source << true;
+		}
+	}
+
+void test_main::copyCnOtherSources()
+	{
+		QFETCH(QString, source);
+		QFETCH(bool, presentCn);
+		QString keyId = certgenRedFixture().first;
+		QJsonObject fields{ { "issuer", "Root CA" }, { "days", 1 } };
+		x509name subject;
+		subject.addEntryByNid(NID_organizationName, "Red test");
+		if (presentCn)
+			subject.addEntryByNid(NID_commonName, "good.example");
+		if (source == "csr") {
+			pki_key *subjectKey = Store.lookupPki<pki_key>(QVariant(keyId.toULongLong()));
+			QVERIFY(subjectKey);
+			extList reqExt;
+			x509v3ext e;
+			reqExt << e.create(NID_subject_alt_name, "DNS:copycn");
+			pki_x509req *req = new pki_x509req("red-csr-copycn");
+			req->createReq(subjectKey, subject, digest::getDefault(), reqExt);
+			req = dynamic_cast<pki_x509req*>(Database.model<db_x509req>()->insert(req));
+			QVERIFY(req);
+			fields["csr"] = req->getSqlItemId().toString();
+		} else {
+			fields["key"] = keyId;
+			fields["subject"] = QJsonObject{ { "O", "Red test" } };
+			if (presentCn)
+				fields["subject"] = QJsonObject{ { "O", "Red test" }, { "CN", "good.example" } };
+			fields["extensions"] = QJsonObject{ { "advanced", "subjectAltName = DNS:copycn\n" } };
+		}
+		QString job = QString::fromUtf8(QJsonDocument(fields).toJson(QJsonDocument::Compact));
+		int n = Store.getAll<pki_x509>().size();
+		if (!presentCn) {
+			QVERIFY2(refused(job), "DNS:copycn without a CN was signed from advanced/CSR");
+			QCOMPARE(Store.getAll<pki_x509>().size(), n);
+		} else {
+			pki_x509 *signedCert = run(job);
+			QVERIFY(signedCert);
+			QCOMPARE(extCount(signedCert, NID_subject_alt_name), 1);
+			int idx = signedCert->getV3ext().idxByNid(NID_subject_alt_name);
+			QVERIFY(idx >= 0);
+			QVERIFY(signedCert->getV3ext()[idx].getValue().contains("DNS:good.example"));
+		}
+	}
+
+void test_main::guiWarningParity_data()
+	{
+		QTest::addColumn<QString>("warning");
+		for (const char *warning : { "subject-length", "mandatory-dn",
+			"insecure-digest", "signer-not-before", "signer-not-after",
+			"no-extensions" })
+			QTest::newRow(warning) << QString(warning);
+	}
+
+void test_main::guiWarningParity()
+	{
+		QFETCH(QString, warning);
+		QString keyId = certgenRedFixture().first;
+		Settings["mandatory_dn"] = QString(); /* isolate warning classes across rows */
+		QJsonObject fields;
+		if (warning == "subject-length")
+			fields["subject"] = QJsonObject{ { "CN", QString(70, 'x') } };
+		else if (warning == "mandatory-dn")
+			Settings["mandatory_dn"] = QString("O");
+		else if (warning == "insecure-digest")
+			fields["hash"] = "MD5";
+		else if (warning == "signer-not-before")
+			fields["not_before"] = "2023-09-18T13:14:00Z";
+		else if (warning == "signer-not-after")
+			fields["not_before"] = "2033-09-19T13:14:00Z";
+		if (warning == "no-extensions")
+			fields["extensions"] = QJsonObject();
+		QString job = issueJob(keyId, fields);
+		int n = Store.getAll<pki_x509>().size();
+		QVERIFY2(refused(job), qPrintable("GUI warning silently continued: " + warning));
+		QCOMPARE(Store.getAll<pki_x509>().size(), n);
+	}
+
+void test_main::implicitInsecureDefaultDigest()
+	{
+		QString keyId = certgenRedFixture().first;
+		Settings["mandatory_dn"] = QString();
+		const QString previousHash = Settings["default_hash"];
+		struct RestoreDefaultHash {
+			QString value;
+			~RestoreDefaultHash() { Settings["default_hash"] = value; }
+		} restore{previousHash};
+		Settings["default_hash"] = QString("MD5");
+		QCOMPARE(digest::getDefault().name(), QString("MD5"));
+		QString job = issueJob(keyId, QJsonObject()); /* no explicit hash */
+		int n = Store.getAll<pki_x509>().size();
+		pki_x509 *issued = nullptr;
+		try {
+			issued = run(job);
+		} catch (errorEx &) {
+			/* An unsafe default must be refused before certificate storage. */
+		}
+		if (issued)
+			QCOMPARE(X509_get_signature_nid(issued->getCert()), NID_md5WithRSAEncryption);
+		QVERIFY2(!issued, "configured MD5 default silently signed without a hash field");
+		QCOMPARE(Store.getAll<pki_x509>().size(), n);
+	}
+
+void test_main::digestEmptyCapabilities()
+	{
+		QProcess p;
+		QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+		env.insert("XCA_CERTGEN_RED_DIGEST_PROBE", "1");
+		p.setProcessEnvironment(env);
+		QString exe = QCoreApplication::applicationFilePath();
+		p.start(exe, { "certgen" });
+		QVERIFY(p.waitForStarted(10000));
+		if (!p.waitForFinished(20000)) {
+			p.kill();
+			p.waitForFinished(5000);
+			QFAIL("digest probe subprocess timed out");
+		}
+		QCOMPARE(p.exitStatus(), QProcess::NormalExit);
+		QCOMPARE(p.exitCode(), 0);
+	}
+
 void test_main::certgen()
 {
+	/* An isolated child probes the shared digest helper: signingDigest()
+	 * passes possibleHashNids() into adjust(), and token keys can return
+	 * an empty list when no supported mechanism is available. */
+	if (qEnvironmentVariableIsSet("XCA_CERTGEN_RED_DIGEST_PROBE")) {
+		digest md = digest::getDefault();
+		try {
+			md.adjust(QList<int>());
+		} catch (errorEx &) {
+			return;
+		}
+		QFAIL("digest::adjust accepted an empty capability list");
+	}
 	try {
 
 	ign_openssl_error();
@@ -153,6 +693,7 @@ void test_main::certgen()
 	QString job4 = jobFile(f4, QString(R"({
 		"issuer": "Root CA", "key": { "generate": "EC:prime256v1" },
 		"subject": { "CN": "console.example.net" }, "days": 1,
+		"extensions": { "keyUsage": "digitalSignature" },
 		"output": { "key": "%1/k2.pem" } })").arg(dir.path()).toUtf8());
 
 	pki_evp::passwd = Passwd();
@@ -193,7 +734,9 @@ void test_main::certgen()
 
 	QTemporaryFile f5, f6;
 	QVERIFY(cli_certgen(jobFile(f5, QString(R"({ "issuer": "Root CA",
-		"csr": "%1", "days": 1 })").arg(good->getSqlItemId().toString()).toUtf8())));
+		"csr": "%1", "days": 1,
+		"extensions": { "keyUsage": "digitalSignature" } })")
+		.arg(good->getSqlItemId().toString()).toUtf8())));
 
 	/* Extension merging: an explicit empty-string removal is not undone
 	 * by the CSR copy, and one extension from two sources is refused. */
@@ -247,7 +790,8 @@ void test_main::certgen()
 		pki_x509 *shortCert = cli_certgen(jobFile(fa, QString(R"({
 			"issuer": "Root CA", "key": "%1", "subject": { "CN": "short" },
 			"not_before": "2031-03-01T10:00:00Z",
-			"not_after": "2031-03-01T16:30:00Z" })").arg(keyId).toUtf8()));
+			"not_after": "2031-03-01T16:30:00Z",
+			"extensions": { "keyUsage": "digitalSignature" } })").arg(keyId).toUtf8()));
 		QVERIFY(shortCert);
 		pki_x509 *r1 = cli_certgen(jobFile(fb2, QString(R"({ "renew": "%1",
 			"not_before": "2031-06-01T23:00:00Z" })")
@@ -319,7 +863,8 @@ void test_main::certgen()
 			.arg(edKey->getSqlItemId().toString()).toUtf8()));
 		QVERIFY(edCa && edCa->canSign());
 		pki_x509 *edLeaf = cli_certgen(jobFile(fd2, QString(R"({ "issuer": "%1",
-			"key": "%2", "subject": { "CN": "ed leaf" }, "days": 1 })")
+			"key": "%2", "subject": { "CN": "ed leaf" }, "days": 1,
+			"extensions": { "keyUsage": "digitalSignature" } })")
 			.arg(edCa->getSqlItemId().toString(), keyId).toUtf8()));
 		QVERIFY(edLeaf);
 		QVERIFY(edLeaf->verify_only(edCa));
@@ -342,6 +887,7 @@ void test_main::certgen()
 		/* fails writing output after the certificate is signed */
 		QString(R"({ "issuer": "Root CA", "key": { "generate": "EC:prime256v1" },
 			"subject": { "CN": "t3" }, "days": 1,
+			"extensions": { "keyUsage": "digitalSignature" },
 			"output": { "cert": "%1/t3.pem", "key": "%2" } })")
 			.arg(dir.path(), unwritable).toUtf8(),
 	}) {
@@ -407,7 +953,7 @@ void test_main::certgen()
 		 * the way an imported or GUI-overridden certificate could be */
 		pki_x509 *leaf = cli_certgen(jobFile(fn2, QString(R"({
 			"issuer": "%1", "key": "%2", "subject": { "CN": "a.inside.example" },
-			"days": 30, "extensions": { "subjectAltName": "DNS:a.inside.example" } })")
+			"days": 29, "extensions": { "subjectAltName": "DNS:a.inside.example" } })")
 			.arg(ica->getSqlItemId().toString(), keyId).toUtf8()));
 		QVERIFY(leaf);
 		pki_x509 *outside = new pki_x509(leaf);
