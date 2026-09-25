@@ -16,7 +16,11 @@ Issuing certificates
 ``--certgen=<json-file>`` issues or renews a certificate without the GUI.
 The job file is a JSON object. Unknown keys are rejected.
 Items are referenced by their database id (see ``--list-items``) or by
-their internal name. An ambiguous name is an error.
+their internal name. An ambiguous name is an error. The command refuses
+conditions that the "New certificate" dialog warns about, including missing
+mandatory subject fields, insecure hashes, validity outside the issuer's
+period and certificates without extensions. Correct the job before retrying;
+there is no interactive "Continue rollout" choice.
 
 Issue a new certificate:
 
@@ -46,7 +50,7 @@ subject
   Distinguished name entries by short or long name. They replace the same
   entries from the template or request.
 name
-  Internal name. Defaults to the request name or the common name.
+  Internal name. Defaults to the request name or the most descriptive subject field.
 not_before / not_after
   ISO-8601 dates. ``not_before`` defaults to now.
 days
@@ -87,4 +91,6 @@ key
   cannot be applied.
 
 Each file is written to a temporary name and renamed into place, so a failed
-write leaves an existing file unchanged.
+staging write leaves an existing file unchanged. Output publication follows
+the database commit. If publication fails, the error names the certificate
+already stored; inspect it before retrying to avoid issuing a duplicate.
