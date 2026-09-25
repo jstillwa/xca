@@ -14,6 +14,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QSet>
+#include <QTimeZone>
 #include <openssl/conf.h>
 #include <openssl/x509v3.h>
 
@@ -496,8 +497,22 @@ static x509name mergeSubject(const x509name &base, const QJsonObject &js)
 	return out;
 }
 
-static a1time templateNotAfter(const a1time &nb, pki_temp *t)
+/* Template validity as the New certificate dialog computes it
+ * (NewX509::on_applyTime_clicked, Validity::setDiff and getDate):
+ * validN units of validM from notBefore; with validMidn, notBefore moves
+ * to 00:00:00 UTC and notAfter to 23:59:59 UTC one day earlier, so a
+ * one-day template covers exactly one calendar day; noWellDefinedExpDate
+ * gives the undefined expiry 99991231235959Z. */
+static void templateValidity(a1time &nb, a1time &na, pki_temp *t)
 {
+	if (t->getSettingInt("noWellDefinedExpDate")) {
+		na.setUndefined();
+		return;
+	}
+	bool midn = t->getSettingInt("validMidn");
+	if (midn)
+		nb = a1time(QDateTime(nb.toUTC().date(), QTime(0, 0, 0),
+				QTimeZone::utc()));
 	int n = t->getSettingInt("validN");
 	QDateTime dt = nb;
 	switch (t->getSettingInt("validM")) {
@@ -505,9 +520,10 @@ static a1time templateNotAfter(const a1time &nb, pki_temp *t)
 	case 1: dt = dt.addMonths(n); break;
 	default: dt = dt.addYears(n); break;
 	}
-	if (t->getSettingInt("validMidn"))
-		dt = dt.addDays(-1);
-	return a1time(dt);
+	if (midn)
+		dt = QDateTime(dt.toUTC().date().addDays(-1), QTime(23, 59, 59),
+				QTimeZone::utc());
+	na = a1time(dt);
 }
 
 /* "key": { "generate": "RSA:4096" } creates the subject key, named after
@@ -542,6 +558,35 @@ static pki_evp *generateKey(const QJsonObject &k, const QJsonObject &job)
 
 /* NewX509::accept() warns when an issuer's name constraints are
  * violated. Without a user to confirm, refuse instead. */
+/* The signature digest must suit the CA key, as the GUI's hash box
+ * ensures with possibleHashNids(). Ed25519 signs without a digest
+ * (NID_undef); DSA supports SHA-1/224/256 only. Without "hash", the
+ * configured default is adjusted to the key; an explicit "hash" the key
+ * cannot use is refused rather than silently replaced. */
+static digest signingDigest(const QJsonObject &job, pki_key *signkey)
+{
+	QList<int> ok = signkey->possibleHashNids();
+	if (!job.contains("hash")) {
+		digest md = digest::getDefault();
+		md.adjust(ok);
+		return md;
+	}
+	QString h = job["hash"].toString();
+	digest md(h);
+	if (ok.contains(NID_undef) && ok.size() == 1) {
+		if (!h.isEmpty())
+			throw errorEx(QObject::tr("The %1 CA key signs without a "
+				"hash; omit 'hash'").arg(signkey->getTypeString()));
+		return md;
+	}
+	if (!md.MD())
+		throw errorEx(QObject::tr("Unknown hash '%1'").arg(h));
+	if (!ok.contains(md.MD() ? EVP_MD_type(md.MD()) : NID_undef))
+		throw errorEx(QObject::tr("The %1 CA key cannot sign with %2")
+			.arg(signkey->getTypeString()).arg(h));
+	return md;
+}
+
 static void checkNameConstraints(pki_x509 *cert, pki_x509 *issuer)
 {
 	for (pki_x509 *crt = issuer, *prev = nullptr; crt && crt != prev;
@@ -615,7 +660,7 @@ static void issue(const QJsonObject &job, db_x509 *certs, jobResult &r)
 		else if (job.contains("days"))
 			na = a1time(nb.addDays(job["days"].toInt()));
 		else if (temp)
-			na = templateNotAfter(nb, temp);
+			templateValidity(nb, na, temp);
 		else
 			throw errorEx(QObject::tr("Give 'days', 'not_after' "
 					"or a 'template'"));
@@ -645,12 +690,7 @@ static void issue(const QJsonObject &job, db_x509 *certs, jobResult &r)
 
 		checkNameConstraints(cert, issuer);
 
-		digest md = job.contains("hash") ?
-			digest(job["hash"].toString()) : digest::getDefault();
-		if (!md.MD())
-			throw errorEx(QObject::tr("Unknown hash '%1'")
-					.arg(job["hash"].toString()));
-		cert->sign(signkey, md);
+		cert->sign(signkey, signingDigest(job, signkey));
 	} catch (...) {
 		delete cert;
 		delete tempKey;

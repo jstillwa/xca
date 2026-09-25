@@ -270,6 +270,61 @@ void test_main::certgen()
 		QVERIFY(r2->getNotAfter().isUndefined());
 	}
 
+	/* Template validity follows the GUI: midnight templates run from
+	 * 00:00:00 to 23:59:59 UTC, and an undefined-expiry template issues
+	 * an undefined notAfter. */
+	{
+		db_temp *temps = Database.model<db_temp>();
+		pki_temp *mid = new pki_temp("midnight 1 day");
+		mid->setSetting("ca", 2);
+		mid->setSetting("validN", 1);
+		mid->setSetting("validM", 0);
+		mid->setSetting("validMidn", 1);
+		mid = dynamic_cast<pki_temp*>(temps->insert(mid));
+		pki_temp *inf = new pki_temp("no expiry");
+		inf->setSetting("ca", 2);
+		inf->setSetting("noWellDefinedExpDate", 1);
+		inf = dynamic_cast<pki_temp*>(temps->insert(inf));
+		QVERIFY(mid && inf);
+		QTemporaryFile fm, fi;
+		pki_x509 *mc = cli_certgen(jobFile(fm, QString(R"({ "issuer": "Root CA",
+			"key": "%1", "template": "%2", "subject": { "CN": "mid" },
+			"not_before": "2031-05-10T14:37:00Z" })")
+			.arg(keyId, mid->getSqlItemId().toString()).toUtf8()));
+		QVERIFY(mc);
+		QCOMPARE(mc->getNotBefore().toPlain(), QString("20310510000000Z"));
+		QCOMPARE(mc->getNotAfter().toPlain(), QString("20310510235959Z"));
+		pki_x509 *ic = cli_certgen(jobFile(fi, QString(R"({ "issuer": "Root CA",
+			"key": "%1", "template": "%2", "subject": { "CN": "inf" } })")
+			.arg(keyId, inf->getSqlItemId().toString()).toUtf8()));
+		QVERIFY(ic);
+		QVERIFY(ic->getNotAfter().isUndefined());
+	}
+
+	/* The digest follows the CA key: an Ed25519 CA signs without one. */
+	{
+		pki_multi *edpem = new pki_multi();
+		edpem->fromPEMbyteArray(pemdata["ED25519 Key"].toUtf8(), QString("ed ca key"));
+		Database.insert(edpem);
+		pki_key *edKey = NULL;
+		foreach(pki_key *k, Store.getAll<pki_key>())
+			if (k->getKeyType() == EVP_PKEY_ED25519)
+				edKey = k;
+		QVERIFY(edKey);
+		QTemporaryFile fd1, fd2;
+		pki_x509 *edCa = cli_certgen(jobFile(fd1, QString(R"({ "issuer": "Root CA",
+			"key": "%1", "name": "ed CA", "subject": { "CN": "ed CA" }, "days": 30,
+			"extensions": { "basicConstraints": "critical, CA:TRUE",
+			"keyUsage": "critical, keyCertSign, cRLSign" } })")
+			.arg(edKey->getSqlItemId().toString()).toUtf8()));
+		QVERIFY(edCa && edCa->canSign());
+		pki_x509 *edLeaf = cli_certgen(jobFile(fd2, QString(R"({ "issuer": "%1",
+			"key": "%2", "subject": { "CN": "ed leaf" }, "days": 1 })")
+			.arg(edCa->getSqlItemId().toString(), keyId).toUtf8()));
+		QVERIFY(edLeaf);
+		QVERIFY(edLeaf->verify_only(edCa));
+	}
+
 	/* A failed job leaves no trace: no certificate, no generated key,
 	 * no output file, and the database stays consistent with Store. */
 	QTemporaryFile f7;
