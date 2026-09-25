@@ -40,6 +40,7 @@ PwDialogCore.cpp	PwDialogCore.h		digest.h
 digest.cpp		pki_export.cpp		debug_info.h
 func_base.cpp		func_base.h		debug_info.cpp
 cmdline.cpp		cli_sign.cpp		cli_sign.h
+secure_file.cpp		secure_file.h
 )
 
 macro(ExpandSources target)

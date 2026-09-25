@@ -16,6 +16,7 @@
 #include "lib/db_x509req.h"
 #include "lib/pki_x509req.h"
 #include "lib/cli_sign.h"
+#include "lib/secure_file.h"
 #include "lib/settings.h"
 #include "lib/BioByteArray.h"
 
@@ -135,10 +136,8 @@ void test_main::certgen()
 	QVERIFY(pk);
 	QCOMPARE(X509_check_private_key(gen->getCert(), pk), 1);
 	EVP_PKEY_free(pk);
-#if !defined(Q_OS_WIN32)
-	QCOMPARE(keyf.permissions() & (QFile::ReadGroup | QFile::ReadOther),
-		QFile::Permissions());
-#endif
+	QVERIFY2(is_owner_only_file(dir.path() + "/k.pem"),
+		"key file is readable beyond its owner");
 
 	/* Console mode leaves the database password unvalidated and offers
 	 * --password to the first prompt only. A job that decrypts several

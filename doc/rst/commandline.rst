@@ -81,4 +81,10 @@ cert
 chain
   The certificate followed by its issuers up to the root.
 key
-  The private key, unencrypted PEM, readable by the owner only.
+  The private key, unencrypted PEM, readable by the owner only. On Windows
+  the file gets its own access list that grants only its owner access and
+  ignores permissions inherited from the folder. The job fails if that
+  cannot be applied.
+
+Each file is written to a temporary name and renamed into place, so a failed
+write leaves an existing file unchanged.

@@ -32,7 +32,7 @@
 #include "pki_temp.h"
 #include "pki_key.h"
 #include "x509rev.h"
-#include "xfile.h"
+#include "secure_file.h"
 #include "pki_evp.h"
 #include "PwDialogCore.h"
 #include "pass_info.h"
@@ -511,17 +511,19 @@ static pki_x509 *issue(const QJsonObject &job, db_x509 *certs,
 static void writeFile(const QString &path, const QByteArray &data,
 			bool secret)
 {
-	XFile f(path);
-	if (!(secret ? f.open_key() : f.open_write()))
-		throw errorEx(QObject::tr("Cannot write '%1'").arg(path));
-	f.write(data);
-	f.close();
+	if (secret)
+		write_owner_only_file(path, data);
+	else
+		write_file_atomic(path, data);
 }
 
 /* "output": { "cert": ..., "chain": ..., "key": ... }
  * chain holds the certificate followed by its issuers up to the root.
- * key is written unencrypted with owner-only permissions, because
- * its consumers (web servers, Kubernetes TLS secrets) need it plain. */
+ * key is written unencrypted with owner-only access (a protected DACL
+ * on Windows, mode 0600 elsewhere), because its consumers (web servers,
+ * Kubernetes TLS secrets) need it plain. Every file is written to a
+ * temporary name and renamed into place, so a failed write keeps the
+ * previous file. */
 static void writeOutput(const QJsonObject &o, pki_x509 *cert)
 {
 	rejectUnknown(o, output_keys, "'output'");
