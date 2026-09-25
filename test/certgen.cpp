@@ -196,6 +196,36 @@ void test_main::certgen()
 		"csr": "%1", "days": 1 })").arg(tampered->getSqlItemId().toString()).toUtf8())), errorEx);
 	QCOMPARE(Store.getAll<pki_x509>().size(), nCsr);
 
+	/* Renewal keeps the exact validity length, including sub-day
+	 * intervals, and keeps an undefined expiry undefined. */
+	{
+		QTemporaryFile fa, fb2, fc;
+		pki_x509 *shortCert = cli_certgen(jobFile(fa, QString(R"({
+			"issuer": "Root CA", "key": "%1", "subject": { "CN": "short" },
+			"not_before": "2031-03-01T10:00:00Z",
+			"not_after": "2031-03-01T16:30:00Z" })").arg(keyId).toUtf8()));
+		QVERIFY(shortCert);
+		pki_x509 *r1 = cli_certgen(jobFile(fb2, QString(R"({ "renew": "%1",
+			"not_before": "2031-06-01T23:00:00Z" })")
+			.arg(shortCert->getSqlItemId().toString()).toUtf8()));
+		QVERIFY(r1);
+		QCOMPARE(r1->getNotBefore().secsTo(r1->getNotAfter()),
+			qint64(6 * 3600 + 1800));
+
+		pki_x509 *noExpiry = new pki_x509(shortCert);
+		a1time undef;
+		undef.setUndefined();
+		noExpiry->setNotAfter(undef);
+		noExpiry->setSerial(Database.model<db_x509>()->getUniqueSerial(root));
+		noExpiry->sign(root->getRefKey(), digest::getDefault());
+		noExpiry = dynamic_cast<pki_x509*>(Database.model<db_x509>()->insert(noExpiry));
+		QVERIFY(noExpiry);
+		pki_x509 *r2 = cli_certgen(jobFile(fc, QString(R"({ "renew": "%1" })")
+			.arg(noExpiry->getSqlItemId().toString()).toUtf8()));
+		QVERIFY(r2);
+		QVERIFY(r2->getNotAfter().isUndefined());
+	}
+
 	/* A failed job leaves no trace: no certificate, no generated key,
 	 * no output file, and the database stays consistent with Store. */
 	QTemporaryFile f7;
@@ -274,6 +304,32 @@ void test_main::certgen()
 		QByteArray(R"({ "issuer": "Root CA", "key": "1", "days": 1,
 			"subject": { "CN": "x" },
 			"extensions": { "keyUsage": "digitalSignatur" } })"),
+		/* wrongly typed values are refused, not coerced */
+		QByteArray(R"({ "issuer": "Root CA", "key": "1", "days": 1,
+			"subject": { "CN": "x" }, "extensions": { "extendedKeyUsage": false } })"),
+		QByteArray(R"({ "issuer": "Root CA", "key": "1", "days": 1,
+			"subject": { "CN": "x", "O": 3 } })"),
+		QByteArray(R"({ "issuer": "Root CA", "key": "1", "days": "30",
+			"subject": { "CN": "x" } })"),
+		QByteArray(R"({ "issuer": "Root CA", "key": "1", "days": 0,
+			"subject": { "CN": "x" } })"),
+		QByteArray(R"({ "issuer": "Root CA", "key": "1", "days": 1.5,
+			"subject": { "CN": "x" } })"),
+		QByteArray(R"({ "issuer": "Root CA", "key": "1", "days": 1,
+			"subject": "CN=x" })"),
+		QByteArray(R"({ "issuer": "Root CA", "key": "1", "days": 1,
+			"subject": { "CN": "x" }, "copy_csr_extensions": "false" })"),
+		QByteArray(R"({ "issuer": "Root CA", "key": "1", "subject": { "CN": "x" },
+			"not_before": "2030-01-02T00:00:00Z", "not_after": "2030-01-01T00:00:00Z" })"),
+		QByteArray(R"({ "issuer": "Root CA", "key": "1", "days": 1,
+			"subject": { "CN": "x" }, "output": "out.pem" })"),
+		/* keys that do not apply to the job type are refused */
+		QString(R"({ "renew": "%1", "hash": "SHA512" })")
+			.arg(cert->getSqlItemId().toString()).toUtf8(),
+		QString(R"({ "renew": "%1", "subject": { "CN": "y" } })")
+			.arg(cert->getSqlItemId().toString()).toUtf8(),
+		QByteArray(R"({ "issuer": "Root CA", "key": "1", "days": 1,
+			"subject": { "CN": "x" }, "keep_serial": true })"),
 	}) {
 		QTemporaryFile fb;
 		QVERIFY_EXCEPTION_THROWN(cli_certgen(jobFile(fb, bad)), errorEx);

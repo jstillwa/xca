@@ -37,10 +37,16 @@
 #include "PwDialogCore.h"
 #include "pass_info.h"
 
-static const QSet<QString> job_keys = {
-	"renew", "keep_serial", "issuer", "key", "csr", "template",
-	"name", "subject", "not_before", "not_after", "days", "hash",
-	"extensions", "copy_csr_extensions", "output",
+/* Keys accepted per job type. A renewal copies subject, key and
+ * extensions from the old certificate, so the issuance-only keys would
+ * be silently ignored there; refusing them is clearer. */
+static const QSet<QString> renew_keys = {
+	"renew", "keep_serial", "not_before", "not_after", "days", "output",
+};
+static const QSet<QString> issue_keys = {
+	"issuer", "key", "csr", "template", "name", "subject", "not_before",
+	"not_after", "days", "hash", "extensions", "copy_csr_extensions",
+	"output",
 };
 
 static const QSet<QString> output_keys = { "cert", "chain", "key" };
@@ -120,6 +126,87 @@ static void checkSignKey(pki_key *key)
 		throw errorEx(QObject::tr("The issuer has no private key"));
 }
 
+static void requireType(const QJsonObject &o, const char *key,
+			QJsonValue::Type type, const char *what)
+{
+	if (o.contains(key) && o[key].type() != type)
+		throw errorEx(QObject::tr("'%1' must be %2").arg(key).arg(what));
+}
+
+/* An item reference: a database id (number or string) or a name. */
+static void requireRef(const QJsonObject &o, const char *key)
+{
+	if (o.contains(key) && !o[key].isString() && !o[key].isDouble())
+		throw errorEx(QObject::tr("'%1' must be an id or a name")
+				.arg(key));
+}
+
+static void requireStrings(const QJsonObject &o, const char *where)
+{
+	for (auto it = o.begin(); it != o.end(); ++it) {
+		if (!it.value().isString())
+			throw errorEx(QObject::tr("'%1' in %2 must be a string")
+				.arg(it.key()).arg(where));
+	}
+}
+
+/* Check the whole job before anything is looked up or built, so that a
+ * wrongly typed value fails loudly instead of being coerced into a
+ * different certificate (an empty string removes an extension, a
+ * non-number day count becomes 0). */
+static void validateJob(const QJsonObject &job, const QString &file)
+{
+	bool renewal = job.contains("renew");
+	rejectUnknown(job, renewal ? renew_keys : issue_keys,
+		renewal ? QObject::tr("%1 (renewal job)").arg(file)
+			: QObject::tr("%1 (issuance job)").arg(file));
+
+	requireRef(job, "renew");
+	requireRef(job, "issuer");
+	requireRef(job, "csr");
+	requireRef(job, "template");
+	if (job.contains("key") && !job["key"].isObject())
+		requireRef(job, "key");
+	requireType(job, "keep_serial", QJsonValue::Bool, "true or false");
+	requireType(job, "copy_csr_extensions", QJsonValue::Bool,
+		"true or false");
+	requireType(job, "name", QJsonValue::String, "a string");
+	requireType(job, "hash", QJsonValue::String, "a string");
+	requireType(job, "not_before", QJsonValue::String, "an ISO-8601 date");
+	requireType(job, "not_after", QJsonValue::String, "an ISO-8601 date");
+	requireType(job, "subject", QJsonValue::Object, "an object");
+	requireType(job, "extensions", QJsonValue::Object, "an object");
+	requireType(job, "output", QJsonValue::Object, "an object");
+
+	if (job.contains("days")) {
+		double d = job["days"].toDouble(-1);
+		if (!job["days"].isDouble() || d != (qint64)d || d < 1 ||
+				d > 36500)
+			throw errorEx(QObject::tr("'days' must be a whole number "
+				"from 1 to 36500"));
+	}
+	if (job.contains("not_after") && job.contains("days"))
+		throw errorEx(QObject::tr("Give 'days' or 'not_after', not both"));
+
+	requireStrings(job["subject"].toObject(), "'subject'");
+	requireStrings(job["extensions"].toObject(), "'extensions'");
+	requireStrings(job["output"].toObject(), "'output'");
+	if (job["key"].isObject()) {
+		QJsonObject k = job["key"].toObject();
+		rejectUnknown(k, { "generate", "name" }, "'key'");
+		requireStrings(k, "'key'");
+	}
+}
+
+/* notBefore must precede notAfter; the GUI warns about the same case. */
+static void checkInterval(const a1time &nb, const a1time &na)
+{
+	if (!na.isUndefined() && na <= nb)
+		throw errorEx(QObject::tr("The certificate would expire (%1) "
+			"before it becomes valid (%2)")
+			.arg(na.toPretty()).arg(nb.toPretty()));
+}
+
 /* Everything a job produced before anything is stored. cert and
  * newKey are owned here until they are inserted into the database. */
 struct jobResult {
@@ -145,10 +232,17 @@ static void renew(const QJsonObject &job, db_x509 *certs, jobResult &r)
 	a1time notAfter;
 	if (job.contains("not_after")) {
 		notAfter = parseTime(job["not_after"], "not_after");
+	} else if (job.contains("days")) {
+		notAfter = a1time(notBefore.addDays(job["days"].toInt()));
+	} else if (old->getNotAfter().isUndefined()) {
+		/* No well-defined expiry (RFC 5280 99991231235959Z) stays so.
+		 * Date arithmetic on it would land past the year 9999. */
+		notAfter.setUndefined();
 	} else {
-		qint64 days = job.contains("days") ? job["days"].toInt() :
-			old->getNotBefore().daysTo(old->getNotAfter());
-		notAfter = a1time(notBefore.addDays(days));
+		/* The exact previous length, in seconds: daysTo() counts
+		 * calendar boundaries and would shorten or lengthen it. */
+		notAfter = a1time(notBefore.addSecs(
+			old->getNotBefore().secsTo(old->getNotAfter())));
 	}
 
 	pki_x509 *cert = new pki_x509(old);
@@ -157,6 +251,7 @@ static void renew(const QJsonObject &job, db_x509 *certs, jobResult &r)
 		cert->setRevoked(x509rev());
 		cert->setSerial(job["keep_serial"].toBool() ?
 			old->getSerial() : certs->getUniqueSerial(signer));
+		checkInterval(notBefore, notAfter);
 		cert->setNotBefore(notBefore);
 		cert->setNotAfter(notAfter);
 		cert->sign(signkey, old->getDigest());
@@ -479,6 +574,7 @@ static void issue(const QJsonObject &job, db_x509 *certs, jobResult &r)
 		else
 			throw errorEx(QObject::tr("Give 'days', 'not_after' "
 					"or a 'template'"));
+		checkInterval(nb, na);
 		cert->setNotBefore(nb);
 		cert->setNotAfter(na);
 
@@ -602,7 +698,7 @@ pki_x509 *cli_certgen(const QString &jsonfile)
 		throw errorEx(QObject::tr("Invalid JSON in '%1': %2")
 				.arg(jsonfile).arg(jerr.errorString()));
 	QJsonObject job = doc.object();
-	rejectUnknown(job, job_keys, jsonfile);
+	validateJob(job, jsonfile);
 
 	unlockDatabasePassword();
 
