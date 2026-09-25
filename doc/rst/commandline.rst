@@ -23,7 +23,7 @@ Issue a new certificate:
 .. code-block:: json
 
   {
-    "issuer": "Nucleix AWS Root",
+    "issuer": "Company AWS Root",
     "key": "*.example.net",
     "template": "TLS_server San Diego",
     "subject": { "CN": "*.example.net" },
