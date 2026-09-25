@@ -13,6 +13,8 @@
 #include "lib/pki_multi.h"
 #include "lib/pki_x509.h"
 #include "lib/db_x509.h"
+#include "lib/db_x509req.h"
+#include "lib/pki_x509req.h"
 #include "lib/cli_sign.h"
 #include "lib/settings.h"
 #include "lib/BioByteArray.h"
@@ -163,6 +165,34 @@ void test_main::certgen()
 	QVERIFY(cli_certgen(job4));
 	QCOMPARE(pwdialog->expect_idx, 1);
 	QVERIFY(QFile::exists(dir.path() + "/k2.pem"));
+
+	/* A CSR must carry a valid signature before the CA signs it */
+	pki_key *subjectKey = Store.lookupPki<pki_key>(QVariant(keyId.toULongLong()));
+	QVERIFY(subjectKey);
+	x509name reqName;
+	reqName.addEntryByNid(NID_commonName, "csr.example.net");
+	pki_x509req *good = new pki_x509req("good-csr");
+	good->createReq(subjectKey, reqName, digest::getDefault(), extList());
+	QVERIFY(good->verify());
+	good = dynamic_cast<pki_x509req*>(Database.model<db_x509req>()->insert(good));
+	QVERIFY(good);
+
+	pki_x509req *tampered = new pki_x509req("tampered-csr");
+	tampered->createReq(subjectKey, reqName, digest::getDefault(), extList());
+	x509name forged;
+	forged.addEntryByNid(NID_commonName, "forged.example.net");
+	tampered->setSubject(forged);        /* changes signed content */
+	QVERIFY(!tampered->verify());
+	tampered = dynamic_cast<pki_x509req*>(Database.model<db_x509req>()->insert(tampered));
+	QVERIFY(tampered);
+
+	QTemporaryFile f5, f6;
+	QVERIFY(cli_certgen(jobFile(f5, QString(R"({ "issuer": "Root CA",
+		"csr": "%1", "days": 1 })").arg(good->getSqlItemId().toString()).toUtf8())));
+	int nCsr = Store.getAll<pki_x509>().size();
+	QVERIFY_EXCEPTION_THROWN(cli_certgen(jobFile(f6, QString(R"({ "issuer": "Root CA",
+		"csr": "%1", "days": 1 })").arg(tampered->getSqlItemId().toString()).toUtf8())), errorEx);
+	QCOMPARE(Store.getAll<pki_x509>().size(), nCsr);
 
 	/* Invalid jobs are refused before anything is stored */
 	int before = Store.getAll<pki_x509>().size();

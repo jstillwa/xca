@@ -418,6 +418,12 @@ static pki_x509 *issue(const QJsonObject &job, db_x509 *certs,
 		throw errorEx(QObject::tr("Give exactly one of 'key' or 'csr'"));
 	if (job.contains("csr")) {
 		req = lookup<pki_x509req>(ref(job, "csr"), "Request");
+		/* The signature proves possession of the key and that the
+		 * subject and extensions are the ones the requester signed.
+		 * NewX509::accept() refuses unverified requests too. */
+		if (!req->verify())
+			throw errorEx(QObject::tr("The signature of request '%1' "
+				"is invalid").arg(req->getIntName()));
 		subjKey = req->getRefKey();
 		if (!subjKey)
 			subjKey = tempKey = req->getPubKey();
