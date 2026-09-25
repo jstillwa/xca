@@ -63,7 +63,11 @@ static Passwd acquire_password(QString source)
 	} else if (source.startsWith("env:")) {
 		pass = getenv(source.mid(4).toLocal8Bit());
 	} else if (source.startsWith("fd:")) {
-		int fd = source.mid(3).toInt();
+		bool valid = false;
+		int fd = source.mid(3).toInt(&valid);
+		if (!valid || fd < 0)
+			throw errorEx(QObject::tr("Invalid password file descriptor '%1'")
+				.arg(source.mid(3)));
 		QFile f;
 		if (!f.open(fd, QIODevice::ReadOnly))
 			throw errorEx(QObject::tr("Cannot read the password from "

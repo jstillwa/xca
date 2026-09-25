@@ -25,6 +25,7 @@ class test_main: public QObject
 
 	void openDB();
 	void dbstatus();
+	QPair<QString, QString> certgenRedFixture(bool renewal = false);
 	static const QMap<QString, QString> pemdata;
 
   private slots:
@@ -37,6 +38,23 @@ class test_main: public QObject
 	void revoke();
 	void testValidity();
 	void certgen();
+	void ownerOnlyProtection_data();
+	void ownerOnlyProtection();
+	void extensionRemoval_data();
+	void extensionRemoval();
+	void extensionRemovalCsr();
+	void credentialExit_data();
+	void credentialExit();
+	void epochValidity_data();
+	void epochValidity();
+	void copyCn_data();
+	void copyCn();
+	void copyCnOtherSources_data();
+	void copyCnOtherSources();
+	void guiWarningParity_data();
+	void guiWarningParity();
+	void implicitInsecureDefaultDigest();
+	void digestEmptyCapabilities();
 
   public:
 	template <class T> static T *findWindow(const QString &name)
