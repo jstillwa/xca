@@ -65,7 +65,9 @@ static Passwd acquire_password(QString source)
 	} else if (source.startsWith("fd:")) {
 		int fd = source.mid(3).toInt();
 		QFile f;
-		f.open(fd, QIODevice::ReadOnly);
+		if (!f.open(fd, QIODevice::ReadOnly))
+			throw errorEx(QObject::tr("Cannot read the password from "
+				"file descriptor %1").arg(fd));
 		pass = f.readLine(128).trimmed();
 	}
 	return pass;
@@ -284,8 +286,17 @@ int read_cmdline(int argc, char *argv[], bool console_only,
 		f.close();
 	}
 	if (cmd_opts.has("import")) {
-		Database.insert(cmdline_items);
-		*_cmdline_items = nullptr;
+		/* Items created by --certgen are already stored and owned by
+		 * the item store. Importing them again would find each one as
+		 * its own duplicate and delete it while the store still holds
+		 * it. Import only the items read from files. */
+		pki_multi *to_import = new pki_multi();
+		for (pki_base *pki : cmdline_items->pull()) {
+			if (pki->getSqlItemId().isValid())
+				continue;
+			to_import->append_item(pki);
+		}
+		Database.insert(to_import);
 	}
 	return EXIT_SUCCESS;
 }

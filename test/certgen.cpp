@@ -8,6 +8,8 @@
 #include <QTest>
 #include <QTemporaryFile>
 #include <QTemporaryDir>
+#include <QProcess>
+#include <QCoreApplication>
 #include <openssl/pem.h>
 
 #include "lib/pki_multi.h"
@@ -231,6 +233,33 @@ void test_main::certgen()
 		"days": 1, "output": { "cert": "%2" } })")
 		.arg(cert->getSqlItemId().toString(), unwritable).toUtf8())), errorEx);
 	QCOMPARE(Store.getAll<pki_x509>().size(), certsBefore);
+
+	/* --certgen together with --import must not hand the stored
+	 * certificate back to the import path, which deletes it as a
+	 * duplicate while the item store still owns it. Run the real binary:
+	 * the double free shows up at process exit. */
+	{
+		QString xca = QCoreApplication::applicationDirPath() + "/xca";
+#if defined(Q_OS_WIN32)
+		xca += ".exe";
+#endif
+		QTemporaryDir cdir;
+		QString db = cdir.path() + "/cli.xdb";
+		QVERIFY(QFile::copy("testdb.xdb", db));
+		QTemporaryFile f9;
+		QString job9 = jobFile(f9, QString(R"({ "renew": "%1", "days": 1 })")
+				.arg(cert->getSqlItemId().toString()).toUtf8());
+		QProcess p;
+		QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
+		env.insert("XCA_NO_GUI", "1");
+		env.insert("XCA_TEST_PW", QString::fromLatin1(dbpass));
+		p.setProcessEnvironment(env);
+		p.start(xca, { "--database=" + db, "--password=env:XCA_TEST_PW",
+			"--certgen=" + job9, "--import" });
+		QVERIFY2(p.waitForFinished(60000), "xca --certgen --import did not exit");
+		QCOMPARE(p.exitStatus(), QProcess::NormalExit);
+		QCOMPARE(p.exitCode(), 0);
+	}
 
 	/* Invalid jobs are refused before anything is stored */
 	int before = Store.getAll<pki_x509>().size();
