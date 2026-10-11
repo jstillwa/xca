@@ -1,0 +1,959 @@
+/* vi: set sw=4 ts=4:
+ *
+ * Copyright (C) 2025 Christian Hohnstaedt.
+ *
+ * All rights reserved.
+ *
+ * Non-interactive certificate issuance and renewal for "--certgen".
+ * Mirrors db_x509::newCert() and db_x509::certRenewal(), which are
+ * bound to the NewX509 / CertExtend dialogs.
+ */
+
+#include <QFile>
+#include <QFileInfo>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QSet>
+#include <QTimeZone>
+#include <openssl/conf.h>
+#include <openssl/x509v3.h>
+
+#include "cli_sign.h"
+#include "exception.h"
+#include "func.h"
+#include "settings.h"
+#include "BioByteArray.h"
+#include "database_model.h"
+#include "db_x509.h"
+#include "db_x509req.h"
+#include "db_key.h"
+#include "db_temp.h"
+#include "pki_x509.h"
+#include "pki_x509req.h"
+#include "pki_temp.h"
+#include "pki_key.h"
+#include "x509rev.h"
+#include "secure_file.h"
+#include "pki_evp.h"
+#include "PwDialogCore.h"
+#include "pass_info.h"
+
+/* Keys accepted per job type. A renewal copies subject, key and
+ * extensions from the old certificate, so the issuance-only keys would
+ * be silently ignored there; refusing them is clearer. */
+static const QSet<QString> renew_keys = {
+	"renew", "keep_serial", "not_before", "not_after", "days", "output",
+};
+static const QSet<QString> issue_keys = {
+	"issuer", "key", "csr", "template", "name", "subject", "not_before",
+	"not_after", "days", "hash", "extensions", "copy_csr_extensions",
+	"output",
+};
+
+static const QSet<QString> output_keys = { "cert", "chain", "key" };
+
+static const QSet<QString> ext_keys = {
+	"basicConstraints", "keyUsage", "extendedKeyUsage",
+	"subjectAltName", "issuerAltName", "nameConstraints",
+	"crlDistributionPoints", "authorityInfoAccess", "nsComment",
+	"subjectKeyIdentifier", "authorityKeyIdentifier", "advanced",
+};
+
+static void rejectUnknown(const QJsonObject &o, const QSet<QString> &allowed,
+			const QString &where)
+{
+	foreach(QString k, o.keys()) {
+		if (!allowed.contains(k))
+			throw errorEx(QObject::tr("Unknown key '%1' in %2")
+					.arg(k).arg(where));
+	}
+}
+
+/* Look up an item by database id or by exact internal name.
+ * Ambiguous names are an error: renewing or signing the wrong
+ * certificate is worse than asking for the id. */
+template <class T> static T *lookup(const QString &ref, const char *what)
+{
+	QList<T*> hits;
+	foreach(T *pki, Store.getAll<T>()) {
+		if (pki->getSqlItemId().toString() == ref)
+			return pki;
+		if (pki->getIntName() == ref)
+			hits << pki;
+	}
+	if (hits.isEmpty())
+		throw errorEx(QObject::tr("%1 '%2' not found").arg(what).arg(ref));
+	if (hits.size() > 1) {
+		QStringList ids;
+		foreach(T *pki, hits)
+			ids << pki->getSqlItemId().toString();
+		throw errorEx(QObject::tr("%1 name '%2' is ambiguous, use one "
+			"of the ids: %3").arg(what).arg(ref).arg(ids.join(", ")));
+	}
+	return hits[0];
+}
+
+/* Accept ids as JSON numbers or strings */
+static QString ref(const QJsonObject &job, const char *key)
+{
+	return job[key].toVariant().toString();
+}
+
+static a1time parseTime(const QJsonValue &v, const char *key)
+{
+	a1time t;
+	QDateTime dt = QDateTime::fromString(v.toString(), Qt::ISODate);
+	if (!dt.isValid() || dt.toSecsSinceEpoch() == 0)
+		throw errorEx(QObject::tr("Invalid or undefined ISO-8601 date in '%1': %2")
+				.arg(key).arg(v.toString()));
+	t = a1time(dt.toUTC());
+	return t;
+}
+
+static pki_x509 *resolveIssuer(const QString &ref)
+{
+	if (ref.isEmpty())
+		throw errorEx(QObject::tr("Missing 'issuer'"));
+	pki_x509 *issuer = lookup<pki_x509>(ref, "Issuer");
+	if (!issuer->canSign())
+		throw errorEx(QObject::tr("Issuer '%1' is not a CA with a "
+			"private key").arg(issuer->getIntName()));
+	return issuer;
+}
+
+static void checkSignKey(pki_key *key)
+{
+	if (!key || key->isPubKey())
+		throw errorEx(QObject::tr("The issuer has no private key"));
+}
+
+static void requireType(const QJsonObject &o, const char *key,
+			QJsonValue::Type type, const char *what)
+{
+	if (o.contains(key) && o[key].type() != type)
+		throw errorEx(QObject::tr("'%1' must be %2").arg(key).arg(what));
+}
+
+/* An item reference: a database id (number or string) or a name. */
+static void requireRef(const QJsonObject &o, const char *key)
+{
+	if (o.contains(key) && !o[key].isString() && !o[key].isDouble())
+		throw errorEx(QObject::tr("'%1' must be an id or a name")
+				.arg(key));
+}
+
+static void requireStrings(const QJsonObject &o, const char *where)
+{
+	for (auto it = o.begin(); it != o.end(); ++it) {
+		if (!it.value().isString())
+			throw errorEx(QObject::tr("'%1' in %2 must be a string")
+				.arg(it.key()).arg(where));
+	}
+}
+
+/* Check the whole job before anything is looked up or built, so that a
+ * wrongly typed value fails loudly instead of being coerced into a
+ * different certificate (an empty string removes an extension, a
+ * non-number day count becomes 0). */
+static void validateJob(const QJsonObject &job, const QString &file)
+{
+	bool renewal = job.contains("renew");
+	rejectUnknown(job, renewal ? renew_keys : issue_keys,
+		renewal ? QObject::tr("%1 (renewal job)").arg(file)
+			: QObject::tr("%1 (issuance job)").arg(file));
+
+	requireRef(job, "renew");
+	requireRef(job, "issuer");
+	requireRef(job, "csr");
+	requireRef(job, "template");
+	if (job.contains("key") && !job["key"].isObject())
+		requireRef(job, "key");
+	requireType(job, "keep_serial", QJsonValue::Bool, "true or false");
+	requireType(job, "copy_csr_extensions", QJsonValue::Bool,
+		"true or false");
+	requireType(job, "name", QJsonValue::String, "a string");
+	requireType(job, "hash", QJsonValue::String, "a string");
+	requireType(job, "not_before", QJsonValue::String, "an ISO-8601 date");
+	requireType(job, "not_after", QJsonValue::String, "an ISO-8601 date");
+	requireType(job, "subject", QJsonValue::Object, "an object");
+	requireType(job, "extensions", QJsonValue::Object, "an object");
+	requireType(job, "output", QJsonValue::Object, "an object");
+
+	if (job.contains("days")) {
+		double d = job["days"].toDouble(-1);
+		if (!job["days"].isDouble() || d != (qint64)d || d < 1 ||
+				d > 36500)
+			throw errorEx(QObject::tr("'days' must be a whole number "
+				"from 1 to 36500"));
+	}
+	if (job.contains("not_after") && job.contains("days"))
+		throw errorEx(QObject::tr("Give 'days' or 'not_after', not both"));
+
+	requireStrings(job["subject"].toObject(), "'subject'");
+	requireStrings(job["extensions"].toObject(), "'extensions'");
+	requireStrings(job["output"].toObject(), "'output'");
+	if (job["key"].isObject()) {
+		QJsonObject k = job["key"].toObject();
+		rejectUnknown(k, { "generate", "name" }, "'key'");
+		requireStrings(k, "'key'");
+	}
+}
+
+/* notBefore must precede notAfter; the GUI warns about the same case. */
+static void checkInterval(const a1time &nb, const a1time &na)
+{
+	if (nb.isUndefined())
+		throw errorEx(QObject::tr("The start date cannot be the undefined epoch date"));
+	if (!na.isUndefined() && na <= nb)
+		throw errorEx(QObject::tr("The certificate would expire (%1) "
+			"before it becomes valid (%2)")
+			.arg(na.toPretty()).arg(nb.toPretty()));
+}
+
+/* Everything a job produced before anything is stored. cert and
+ * newKey are owned here until they are inserted into the database. */
+struct jobResult {
+	pki_x509 *cert{};        /* signed, not yet stored */
+	pki_x509 *issuer{};      /* stored CA that signed cert */
+	pki_evp *newKey{};       /* generated subject key, not yet stored */
+	pki_key *outKey{};       /* private key for output.key, if any */
+	pki_x509req *req{};      /* request to mark as signed */
+};
+
+static void checkSubject(const x509name &subject)
+{
+	QString lengthError = subject.checkLength();
+	if (!lengthError.isEmpty())
+		throw errorEx(QObject::tr("Subject length restrictions are violated: %1")
+			.arg(lengthError));
+	for (const QString &field : QString(Settings["mandatory_dn"]).split(",", Qt::SkipEmptyParts)) {
+		int nid = OBJ_txt2nid(CCHAR(field.trimmed()));
+		if (nid != NID_undef && subject.getEntryByNid(nid).isEmpty())
+			throw errorEx(QObject::tr("Mandatory subject field '%1' is missing")
+				.arg(field));
+	}
+}
+
+static void checkNameConstraints(pki_x509 *cert, pki_x509 *issuer);
+static void checkSignerValidity(const a1time &nb, const a1time &na,
+			pki_x509 *issuer);
+
+static void renew(const QJsonObject &job, db_x509 *certs, jobResult &r)
+{
+	pki_x509 *old = lookup<pki_x509>(ref(job, "renew"), "Certificate");
+	pki_x509 *signer = old->getSigner();
+	if (!signer || signer == old)
+		throw errorEx(QObject::tr("Certificate '%1' has no known issuer "
+			"in the database").arg(old->getIntName()));
+	/* The recorded signer is whichever stored certificate verifies the
+	 * old signature; it is not necessarily a CA. Issuance checks the
+	 * same through resolveIssuer(). */
+	if (!signer->canSign())
+		throw errorEx(QObject::tr("Issuer '%1' is not a CA with a "
+			"private key").arg(signer->getIntName()));
+	pki_key *signkey = signer->getRefKey();
+	checkSignKey(signkey);
+
+	a1time notBefore = job.contains("not_before") ?
+		parseTime(job["not_before"], "not_before") : a1time(a1time::now());
+	a1time notAfter;
+	if (job.contains("not_after")) {
+		notAfter = parseTime(job["not_after"], "not_after");
+	} else if (job.contains("days")) {
+		notAfter = a1time(notBefore.addDays(job["days"].toInt()));
+	} else if (old->getNotAfter().isUndefined()) {
+		/* No well-defined expiry (RFC 5280 99991231235959Z) stays so.
+		 * Date arithmetic on it would land past the year 9999. */
+		notAfter.setUndefined();
+	} else {
+		/* The exact previous length, in seconds: daysTo() counts
+		 * calendar boundaries and would shorten or lengthen it. */
+		notAfter = a1time(notBefore.addSecs(
+			old->getNotBefore().secsTo(old->getNotAfter())));
+	}
+
+	pki_x509 *cert = new pki_x509(old);
+	try {
+		cert->pkiSource = renewed;
+		cert->setRevoked(x509rev());
+		cert->setSerial(job["keep_serial"].toBool() ?
+			old->getSerial() : certs->getUniqueSerial(signer));
+		checkInterval(notBefore, notAfter);
+		if (notAfter.isUndefined() &&
+				(job.contains("days") || !old->getNotAfter().isUndefined()))
+			throw errorEx(QObject::tr("The calculated expiry aliases the undefined epoch date"));
+		cert->setNotBefore(notBefore);
+		cert->setNotAfter(notAfter);
+		checkSubject(cert->getSubject());
+		if (cert->getV3ext().isEmpty())
+			throw errorEx(QObject::tr("The certificate contains no extensions"));
+		checkSignerValidity(notBefore, notAfter, signer);
+		checkNameConstraints(cert, signer);
+		if (old->getDigest().isInsecure())
+			throw errorEx(QObject::tr("The renewal signature hash is insecure"));
+		cert->sign(signkey, old->getDigest());
+	} catch (...) {
+		delete cert;
+		throw;
+	}
+	r.cert = cert;
+	r.issuer = signer;
+	r.outKey = old->getRefKey();
+}
+
+/* Collected extension config strings in the order NewX509::getAllExt()
+ * applies them. Empty strings mean "omit". */
+struct extConf {
+	QString bc, ski, aki, ku, eku, nameCons, san, ian, crlDist, aia;
+	QString ocsp, nsCertType, nsComment, advanced;
+	QString nsBaseUrl, nsRevocationUrl, nsCARevocationUrl, nsRenewalUrl;
+	QString nsCaPolicyUrl, nsSslServerName;
+	/* NIDs the job set to "" explicitly: omitted here and not copied
+	 * back in from a request. */
+	QSet<int> removed;
+};
+
+static QString kuFromBits(int bits, bool critical)
+{
+	static const char *names[] = {
+		"digitalSignature", "nonRepudiation", "keyEncipherment",
+		"dataEncipherment", "keyAgreement", "keyCertSign",
+		"cRLSign", "encipherOnly", "decipherOnly"
+	};
+	QStringList l;
+	for (int i = 0; i < 9; i++)
+		if (bits & (1 << i))
+			l << names[i];
+	if (critical && !l.isEmpty())
+		l.prepend("critical");
+	return l.join(", ");
+}
+
+static QString nsCertTypeFromBits(int bits)
+{
+	static const char *names[] = {
+		"client", "server", "email", "objsign",
+		"sslCA", "emailCA", "objCA"
+	};
+	QStringList l;
+	for (int i = 0; i < 7; i++)
+		if (bits & (1 << i))
+			l << names[i];
+	return l.join(", ");
+}
+
+static void fromTemplate(extConf &c, pki_temp *t)
+{
+	QStringList bc;
+	int ca = t->getSettingInt("ca");
+	if (ca > 0) {
+		if (t->getSettingInt("bcCritical"))
+			bc << "critical";
+		bc << (ca == 1 ? "CA:TRUE" : "CA:FALSE");
+		if (ca == 1 && !t->getSetting("basicPath").isEmpty())
+			bc << "pathlen:" + t->getSetting("basicPath");
+	}
+	c.bc = bc.join(", ");
+	c.ski = t->getSettingInt("subKey") ? "hash" : "";
+	c.aki = t->getSettingInt("authKey") ? "keyid,issuer" : "";
+	c.ku = kuFromBits(t->getSettingInt("keyUse"),
+				t->getSettingInt("kuCritical"));
+	c.eku = t->getSetting("eKeyUse");
+	if (t->getSettingInt("ekuCritical") && !c.eku.isEmpty())
+		c.eku = "critical, " + c.eku;
+	c.nameCons = t->getSetting("nameCons");
+	c.san = t->getSetting("subAltName");
+	c.ian = t->getSetting("issAltName");
+	c.crlDist = t->getSetting("crlDist");
+	c.aia = t->getSetting("authInfAcc");
+	c.ocsp = t->getSettingInt("OCSPstaple") ? "status_request" : "";
+	c.nsCertType = nsCertTypeFromBits(t->getSettingInt("nsCertType"));
+	c.nsComment = t->getSetting("nsComment");
+	c.nsBaseUrl = t->getSetting("nsBaseUrl");
+	c.nsRevocationUrl = t->getSetting("nsRevocationUrl");
+	c.nsCARevocationUrl = t->getSetting("nsCARevocationUrl");
+	c.nsRenewalUrl = t->getSetting("nsRenewalUrl");
+	c.nsCaPolicyUrl = t->getSetting("nsCaPolicyUrl");
+	c.nsSslServerName = t->getSetting("nsSslServerName");
+	c.advanced = t->getSetting("adv_ext");
+}
+
+static void fromJson(extConf &c, const QJsonObject &e)
+{
+	rejectUnknown(e, ext_keys, "'extensions'");
+	struct { const char *key; QString *dst; int nid; } map[] = {
+		{ "basicConstraints", &c.bc, NID_basic_constraints },
+		{ "subjectKeyIdentifier", &c.ski, NID_subject_key_identifier },
+		{ "authorityKeyIdentifier", &c.aki, NID_authority_key_identifier },
+		{ "keyUsage", &c.ku, NID_key_usage },
+		{ "extendedKeyUsage", &c.eku, NID_ext_key_usage },
+		{ "nameConstraints", &c.nameCons, NID_name_constraints },
+		{ "subjectAltName", &c.san, NID_subject_alt_name },
+		{ "issuerAltName", &c.ian, NID_issuer_alt_name },
+		{ "crlDistributionPoints", &c.crlDist, NID_crl_distribution_points },
+		{ "authorityInfoAccess", &c.aia, NID_info_access },
+		{ "nsComment", &c.nsComment, NID_netscape_comment },
+		{ "advanced", &c.advanced, NID_undef },
+	};
+	for (auto &m : map) {
+		if (!e.contains(m.key))
+			continue;
+		*m.dst = e[m.key].toString();
+		if (m.dst->isEmpty() && m.nid != NID_undef)
+			c.removed << m.nid;
+	}
+}
+
+/* Same mechanism as NewX509::getAdvanced(): an OpenSSL config
+ * "[default]" section applied to ctx->subject_cert. */
+static void applyAdvanced(const QString &conf_str, X509V3_CTX *ctx)
+{
+	if (conf_str.trimmed().isEmpty())
+		return;
+	long err_line = 0;
+	CONF *conf = NCONF_new(NULL);
+	if (NCONF_load_bio(conf, BioByteArray(conf_str.toLatin1()).ro(),
+				&err_line) != 1) {
+		NCONF_free(conf);
+		throw errorEx(QObject::tr("Advanced extensions: config error "
+			"on line %1").arg(err_line));
+	}
+	X509V3_set_nconf(ctx, conf);
+	int ok = X509V3_EXT_add_nconf(conf, ctx, (char *)"default",
+					ctx->subject_cert);
+	X509V3_set_nconf(ctx, NULL);
+	NCONF_free(conf);
+	if (!ok)
+		openssl_error();
+}
+
+/* x509v3ext::create() adds the extension to ctx->subject_cert
+ * directly, so nothing here calls pki_x509::addV3ext().
+ * create() also swallows OpenSSL errors; a malformed value must not
+ * silently produce a certificate without that extension. */
+static void addExt(int nid, const QString &val, X509V3_CTX *ctx,
+			bool ia5 = false)
+{
+	if (val.isEmpty())
+		return;
+	x509v3ext e;
+	if (ia5)
+		e.create_ia5(nid, val, ctx);
+	else
+		e.create(nid, val, ctx);
+	if (!e.isValid())
+		throw errorEx(QObject::tr("Invalid %1: '%2'")
+				.arg(OBJ_nid2ln(nid)).arg(val));
+}
+
+static void applyExtensions(const extConf &c, X509V3_CTX *ctx)
+{
+	addExt(NID_basic_constraints, c.bc, ctx);
+	addExt(NID_subject_key_identifier, c.ski, ctx);
+	addExt(NID_authority_key_identifier, c.aki, ctx);
+	addExt(NID_key_usage, c.ku, ctx);
+	addExt(NID_ext_key_usage, c.eku, ctx);
+	addExt(NID_name_constraints, c.nameCons, ctx);
+	addExt(NID_subject_alt_name, c.san, ctx);
+	addExt(NID_issuer_alt_name, c.ian, ctx);
+	addExt(NID_crl_distribution_points, c.crlDist, ctx);
+	addExt(NID_info_access, c.aia, ctx);
+	addExt(NID_tlsfeature, c.ocsp, ctx);
+	applyAdvanced(c.advanced, ctx);
+	if (!Settings["disable_netscape"]) {
+		/* the same set and order as NewX509::getNetscapeExt() */
+		addExt(NID_netscape_cert_type, c.nsCertType, ctx);
+		addExt(NID_netscape_base_url, c.nsBaseUrl, ctx, true);
+		addExt(NID_netscape_revocation_url, c.nsRevocationUrl, ctx, true);
+		addExt(NID_netscape_ca_revocation_url, c.nsCARevocationUrl, ctx, true);
+		addExt(NID_netscape_renewal_url, c.nsRenewalUrl, ctx, true);
+		addExt(NID_netscape_ca_policy_url, c.nsCaPolicyUrl, ctx, true);
+		addExt(NID_netscape_ssl_server_name, c.nsSslServerName, ctx, true);
+		addExt(NID_netscape_comment, c.nsComment, ctx, true);
+	}
+}
+
+/* An explicit empty JSON extension is authoritative over every source,
+ * including the template's advanced config and a copied CSR. Filter by
+ * NID on the finished certificate, leaving unrelated OIDs intact. */
+static void removeExtensions(pki_x509 *cert, const QSet<int> &removed)
+{
+	for (int nid : removed) {
+		int idx;
+		while ((idx = X509_get_ext_by_NID(cert->getCert(), nid, -1)) >= 0)
+			X509_EXTENSION_free(X509_delete_ext(cert->getCert(), idx));
+	}
+}
+
+/* Named SAN fields already expand DNS:copycn through x509v3ext::create.
+ * Advanced config and CSR extensions can carry the literal token; expand
+ * it against the final subject, or refuse if there is no common name. */
+static void resolveCopyCn(pki_x509 *cert, X509V3_CTX *ctx)
+{
+	int idx = X509_get_ext_by_NID(cert->getCert(), NID_subject_alt_name, -1);
+	if (idx < 0)
+		return;
+	x509v3ext san(X509_get_ext(cert->getCert(), idx));
+	QString value = san.getValue();
+	if (!value.contains("DNS:copycn"))
+		return;
+	QString cn = cert->getSubject().getEntryByNid(NID_commonName);
+	if (cn.isEmpty())
+		throw errorEx(QObject::tr("DNS:copycn requires a common name"));
+	X509_EXTENSION_free(X509_delete_ext(cert->getCert(), idx));
+	value.replace("DNS:copycn", "DNS:" + cn);
+	addExt(NID_subject_alt_name, san.getCritical() ? "critical, " + value : value, ctx);
+}
+
+/* RFC 5280 allows each extension once. The named fields, the template,
+ * "advanced" and the request can each supply one; the GUI refuses the
+ * same collision in NewX509::validateExtensions(). */
+static void checkDuplicateExtensions(const pki_x509 *cert)
+{
+	extList el = cert->getV3ext();
+	QSet<int> seen;
+	for (const x509v3ext &e : el) {
+		if (seen.contains(e.nid()))
+			throw errorEx(QObject::tr("Extension '%1' is given more than "
+				"once").arg(OBJ_nid2ln(e.nid())));
+		seen << e.nid();
+	}
+}
+
+/* Replace or add the JSON entries and lay the name out like
+ * NewX509::getX509name(): the explicit_dn fields in their configured
+ * order first, then all other entries in their original order.
+ * The same entries in another order form a different DN. */
+static x509name mergeSubject(const x509name &base, const QJsonObject &js)
+{
+	QList<QPair<int, QString>> entries;
+	for (int i = 0; i < base.entryCount(); i++)
+		entries << qMakePair(base.nid(i), base.getEntry(i));
+	foreach(QString k, js.keys()) {
+		int nid = OBJ_txt2nid(CCHAR(k));
+		if (nid == NID_undef)
+			throw errorEx(QObject::tr("Unknown subject field '%1'")
+					.arg(k));
+		for (int i = entries.size() - 1; i >= 0; i--)
+			if (entries[i].first == nid)
+				entries.removeAt(i);
+		entries << qMakePair(nid, js[k].toString());
+	}
+	x509name out;
+	foreach(QString sn, Settings["explicit_dn"].split(",")) {
+		int nid = OBJ_txt2nid(CCHAR(sn.trimmed()));
+		for (int i = 0; i < entries.size(); ) {
+			if (entries[i].first == nid) {
+				out.addEntryByNid(nid, entries[i].second);
+				entries.removeAt(i);
+			} else {
+				i++;
+			}
+		}
+	}
+	for (const auto &e : entries)
+		out.addEntryByNid(e.first, e.second);
+	return out;
+}
+
+/* Template validity as the New certificate dialog computes it
+ * (NewX509::on_applyTime_clicked, Validity::setDiff and getDate):
+ * validN units of validM from notBefore; with validMidn, notBefore moves
+ * to 00:00:00 UTC and notAfter to 23:59:59 UTC one day earlier, so a
+ * one-day template covers exactly one calendar day; noWellDefinedExpDate
+ * gives the undefined expiry 99991231235959Z. */
+static void templateValidity(a1time &nb, a1time &na, pki_temp *t)
+{
+	if (t->getSettingInt("noWellDefinedExpDate")) {
+		na.setUndefined();
+		return;
+	}
+	bool midn = t->getSettingInt("validMidn");
+	if (midn)
+		nb = a1time(QDateTime(nb.toUTC().date(), QTime(0, 0, 0),
+				QTimeZone::utc()));
+	int n = t->getSettingInt("validN");
+	QDateTime dt = nb;
+	switch (t->getSettingInt("validM")) {
+	case 0: dt = dt.addDays(n); break;
+	case 1: dt = dt.addMonths(n); break;
+	default: dt = dt.addYears(n); break;
+	}
+	if (midn)
+		dt = QDateTime(dt.toUTC().date().addDays(-1), QTime(23, 59, 59),
+				QTimeZone::utc());
+	na = a1time(dt);
+}
+
+/* "key": { "generate": "RSA:4096" } creates the subject key, named after
+ * the job, as the "New key" dialog would. The key is returned unstored;
+ * cli_certgen() stores it together with the certificate. */
+static pki_evp *generateKey(const QJsonObject &k, const QJsonObject &job)
+{
+	rejectUnknown(k, { "generate", "name" }, "'key'");
+	keyjob task(k["generate"].toString());
+	if (!task.isValid() || (!task.isEC() && !task.isED25519() &&
+				(task.size < 2048 || task.size > 8192)))
+		throw errorEx(QObject::tr("Invalid key type '%1', expected e.g. "
+			"RSA:4096, EC:prime256v1 or ED25519")
+			.arg(k["generate"].toString()));
+	QString name = k["name"].toString();
+	if (name.isEmpty())
+		name = job["name"].toString();
+	if (name.isEmpty())
+		name = job["subject"].toObject()["CN"].toString();
+	pki_evp *key = new pki_evp(name);
+	try {
+		key->generate(task);
+		key->pkiSource = generated;
+		if (key->getIntName().isEmpty())
+			key->autoIntName(name);
+	} catch (...) {
+		delete key;
+		throw;
+	}
+	return key;
+}
+
+/* NewX509::accept() warns when an issuer's name constraints are
+ * violated. Without a user to confirm, refuse instead. */
+/* The signature digest must suit the CA key, as the GUI's hash box
+ * ensures with possibleHashNids(). Ed25519 signs without a digest
+ * (NID_undef); DSA supports SHA-1/224/256 only. Without "hash", the
+ * configured default is adjusted to the key; an explicit "hash" the key
+ * cannot use is refused rather than silently replaced. */
+static digest signingDigest(const QJsonObject &job, pki_key *signkey)
+{
+	QList<int> ok = signkey->possibleHashNids();
+	if (ok.isEmpty())
+		throw errorEx(QObject::tr("The CA key has no supported signature hashes"));
+	if (!job.contains("hash")) {
+		digest md = digest::getDefault();
+		if (md.isInsecure())
+			throw errorEx(QObject::tr("The configured signature hash is insecure"));
+		md.adjust(ok);
+		if (md.isInsecure())
+			throw errorEx(QObject::tr("The CA key only offers an insecure signature hash"));
+		return md;
+	}
+	QString h = job["hash"].toString();
+	digest md(h);
+	if (ok.contains(NID_undef) && ok.size() == 1) {
+		if (!h.isEmpty())
+			throw errorEx(QObject::tr("The %1 CA key signs without a "
+				"hash; omit 'hash'").arg(signkey->getTypeString()));
+		return md;
+	}
+	if (!md.MD())
+		throw errorEx(QObject::tr("Unknown hash '%1'").arg(h));
+	if (!ok.contains(md.MD() ? EVP_MD_type(md.MD()) : NID_undef))
+		throw errorEx(QObject::tr("The %1 CA key cannot sign with %2")
+			.arg(signkey->getTypeString()).arg(h));
+	if (md.isInsecure())
+		throw errorEx(QObject::tr("The signature hash '%1' is insecure").arg(h));
+	return md;
+}
+
+static void checkSignerValidity(const a1time &nb, const a1time &na,
+			pki_x509 *issuer)
+{
+	/* X.509 encodes whole seconds; comparing QDateTime milliseconds
+	 * would wrongly reject a certificate with the same encoded expiry. */
+	if (nb.toSecsSinceEpoch() < issuer->getNotBefore().toSecsSinceEpoch() ||
+			(!na.isUndefined() && !issuer->getNotAfter().isUndefined() &&
+			 na.toSecsSinceEpoch() > issuer->getNotAfter().toSecsSinceEpoch()))
+		throw errorEx(QObject::tr("Certificate validity [%1, %2] exceeds signer '%3' validity [%4, %5]")
+			.arg(nb.toPlain()).arg(na.toPlain()).arg(issuer->getIntName())
+			.arg(issuer->getNotBefore().toPlain())
+			.arg(issuer->getNotAfter().toPlain()));
+}
+
+static void checkNameConstraints(pki_x509 *cert, pki_x509 *issuer)
+{
+	for (pki_x509 *crt = issuer, *prev = nullptr; crt && crt != prev;
+			prev = crt, crt = crt->getSigner()) {
+		int rc = cert->name_constraint_check(crt);
+		if (rc != X509_V_OK)
+			throw errorEx(QObject::tr("A name constraint of the issuer "
+				"'%1' is violated: %2").arg(crt->getIntName())
+				.arg(get_ossl_verify_error(rc)));
+	}
+}
+
+static void issue(const QJsonObject &job, db_x509 *certs, jobResult &r)
+{
+	pki_x509 *issuer = resolveIssuer(ref(job, "issuer"));
+	pki_key *signkey = issuer->getRefKey();
+	checkSignKey(signkey);
+
+	pki_x509req *req = NULL;
+	pki_key *subjKey = NULL, *tempKey = NULL;
+	if (job.contains("csr") == job.contains("key"))
+		throw errorEx(QObject::tr("Give exactly one of 'key' or 'csr'"));
+	if (job.contains("csr")) {
+		req = lookup<pki_x509req>(ref(job, "csr"), "Request");
+		/* The signature proves possession of the key and that the
+		 * subject and extensions are the ones the requester signed.
+		 * NewX509::accept() refuses unverified requests too. */
+		if (!req->verify())
+			throw errorEx(QObject::tr("The signature of request '%1' "
+				"is invalid").arg(req->getIntName()));
+		subjKey = req->getRefKey();
+		if (!subjKey)
+			subjKey = tempKey = req->getPubKey();
+	} else if (job["key"].isObject()) {
+		subjKey = r.newKey = generateKey(job["key"].toObject(), job);
+	} else {
+		subjKey = lookup<pki_key>(ref(job, "key"), "Key");
+	}
+
+	pki_temp *temp = NULL;
+	pki_x509 *cert = NULL;
+	try {
+		if (job.contains("template"))
+			temp = lookup<pki_temp>(ref(job, "template"), "Template");
+		cert = new pki_x509();
+		/* Subject: template, then CSR, then explicit JSON entries */
+		x509name subj = req ? req->getSubject() :
+				(temp ? temp->getSubject() : x509name());
+		QJsonObject js = job["subject"].toObject();
+		if (!js.isEmpty())
+			subj = mergeSubject(subj, js);
+		if (subj.entryCount() == 0)
+			throw errorEx(QObject::tr("Empty subject"));
+		checkSubject(subj);
+
+		QString name = job["name"].toString();
+		if (name.isEmpty())
+			name = req ? req->getIntName() : subj.getMostPopular();
+		cert->setIntName(name);
+		cert->setSubject(subj);
+		cert->setPubKey(subjKey);
+		cert->setIssuer(issuer->getSubject());
+		cert->setSerial(certs->getUniqueSerial(issuer));
+		cert->pkiSource = generated;
+
+		a1time nb = job.contains("not_before") ?
+			parseTime(job["not_before"], "not_before") :
+			a1time(a1time::now());
+		a1time na;
+		if (job.contains("not_after"))
+			na = parseTime(job["not_after"], "not_after");
+		else if (job.contains("days"))
+			na = a1time(nb.addDays(job["days"].toInt()));
+		else if (temp)
+			templateValidity(nb, na, temp);
+		else
+			throw errorEx(QObject::tr("Give 'days', 'not_after' "
+					"or a 'template'"));
+		checkInterval(nb, na);
+		if (na.isUndefined() && !(temp &&
+				temp->getSettingInt("noWellDefinedExpDate")))
+			throw errorEx(QObject::tr("The calculated expiry aliases the undefined epoch date"));
+		cert->setNotBefore(nb);
+		cert->setNotAfter(na);
+		checkSignerValidity(nb, na, issuer);
+
+		extConf conf;
+		if (temp)
+			fromTemplate(conf, temp);
+		fromJson(conf, job["extensions"].toObject());
+
+		X509V3_CTX ctx;
+		X509V3_set_ctx(&ctx, issuer->getCert(), cert->getCert(),
+				req ? req->getReq() : NULL, NULL, 0);
+		X509V3_set_ctx_nodb(&ctx);
+		applyExtensions(conf, &ctx);
+
+		if (req && job["copy_csr_extensions"].toBool(true)) {
+			extList el = req->getV3ext();
+			for (int i = 0; i < el.count(); i++) {
+				if (!conf.removed.contains(el[i].nid()))
+					cert->addV3ext(el[i], true);
+			}
+		}
+		removeExtensions(cert, conf.removed);
+		resolveCopyCn(cert, &ctx);
+		checkDuplicateExtensions(cert);
+		if (cert->getV3ext().isEmpty())
+			throw errorEx(QObject::tr("The certificate contains no extensions"));
+
+		checkNameConstraints(cert, issuer);
+
+		cert->sign(signkey, signingDigest(job, signkey));
+	} catch (...) {
+		delete cert;
+		delete tempKey;
+		delete r.newKey;
+		r.newKey = NULL;
+		throw;
+	}
+	delete tempKey;
+	r.cert = cert;
+	r.issuer = issuer;
+	r.outKey = tempKey ? NULL : subjKey;
+	r.req = req;
+}
+
+/* "output": { "cert": ..., "chain": ..., "key": ... }
+ * chain holds the certificate followed by its issuers up to the root.
+ * key is written unencrypted with owner-only access (a protected DACL
+ * on Windows, mode 0600 elsewhere), because its consumers (web servers,
+ * Kubernetes TLS secrets) need it plain.
+ * Files are only staged here, as temporary files beside their
+ * destinations; cli_certgen() publishes them after the database commit. */
+static void stageOutput(const QJsonObject &o, const jobResult &r,
+			QList<staged_file *> &staged)
+{
+	rejectUnknown(o, output_keys, "'output'");
+	if (o.contains("cert")) {
+		BioByteArray b;
+		PEM_write_bio_X509(b, r.cert->getCert());
+		staged << new staged_file(o["cert"].toString(), b, false);
+	}
+	if (o.contains("chain")) {
+		BioByteArray b;
+		PEM_write_bio_X509(b, r.cert->getCert());
+		for (pki_x509 *c = r.issuer, *prev = r.cert; c && c != prev;
+				prev = c, c = c->getSigner())
+			PEM_write_bio_X509(b, c->getCert());
+		staged << new staged_file(o["chain"].toString(), b, false);
+	}
+	if (o.contains("key")) {
+		pki_evp *key = dynamic_cast<pki_evp *>(r.outKey);
+		if (!key || key->isPubKey())
+			throw errorEx(QObject::tr("No private key for '%1' in "
+				"the database").arg(r.cert->getIntName()));
+		EVP_PKEY *pkey = key->decryptKey();
+		BioByteArray b;
+		PEM_write_bio_PrivateKey(b, pkey, NULL, NULL, 0, NULL, NULL);
+		EVP_PKEY_free(pkey);
+		staged << new staged_file(o["key"].toString(), b, true);
+	}
+	openssl_error();
+}
+
+/* Remove an item that insertPKI() added to the in-memory store when the
+ * surrounding transaction rolls back. */
+static void forget(db_base *model, pki_base *pki)
+{
+	if (!pki)
+		return;
+	model->remFromCont(model->index(pki));
+	Store.remove(pki->getSqlItemId());
+	delete pki;
+}
+
+/* Console mode opens the database without checking its password, and the
+ * --password value is consumed by the first prompt. A job may need the
+ * database password several times (new key, CA key), so validate it
+ * once here and keep it for the whole job. */
+static void unlockDatabasePassword()
+{
+	if (pki_evp::validateDatabasePassword(pki_evp::passwd))
+		return;
+	if (pki_evp::passHash.isEmpty())
+		return;
+	pass_info p(XCA_TITLE, QObject::tr("Please enter the database "
+			"password"));
+	Passwd pass;
+	if (PwDialogCore::execute(&p, &pass, false) != pw_ok ||
+	    !pki_evp::validateDatabasePassword(pass))
+		throw errorEx(QObject::tr("Wrong or missing database password. "
+			"Use --password"));
+	pki_evp::passwd = pass;
+}
+
+static pki_x509 *runJob(const QString &jsonfile)
+{
+	QFile file(jsonfile);
+	if (!file.open(QIODevice::ReadOnly))
+		throw errorEx(QObject::tr("Failed to open '%1'").arg(jsonfile));
+
+	QJsonParseError jerr;
+	QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &jerr);
+	if (jerr.error != QJsonParseError::NoError || !doc.isObject())
+		throw errorEx(QObject::tr("Invalid JSON in '%1': %2")
+				.arg(jsonfile).arg(jerr.errorString()));
+	QJsonObject job = doc.object();
+	validateJob(job, jsonfile);
+
+	unlockDatabasePassword();
+
+	db_x509 *certs = Database.model<db_x509>();
+	db_key *keys = Database.model<db_key>();
+	jobResult r;
+	if (job.contains("renew"))
+		renew(job, certs, r);
+	else
+		issue(job, certs, r);
+
+	/* Every step that can fail runs before the database is written, so
+	 * a failed job stores nothing and leaves existing files untouched.
+	 * The key, the certificate and the request update share one
+	 * transaction, as db_x509::newCert() does. */
+	QList<staged_file *> staged;
+	pki_key *storedKey = NULL;
+	pki_x509 *cert = NULL;
+	try {
+		if (job.contains("output"))
+			stageOutput(job["output"].toObject(), r, staged);
+
+		Transaction;
+		TransThrow();
+		if (r.newKey) {
+			pki_evp *k = r.newKey;
+			r.newKey = NULL;         /* insert() owns it from here */
+			storedKey = dynamic_cast<pki_key *>(keys->insert(k));
+			if (!storedKey)
+				throw errorEx(QObject::tr("Generated key was not stored"));
+		}
+		pki_x509 *c = r.cert;
+		r.cert = NULL;
+		cert = dynamic_cast<pki_x509 *>(certs->insert(c));
+		if (!cert)
+			throw errorEx(QObject::tr("Certificate was not stored"));
+		certs->markRequestSigned(r.req, cert);
+		if (!TransCommit())
+			throw errorEx(QObject::tr("Failed to commit the database "
+				"transaction"));
+	} catch (...) {
+		/* ponytail: in-memory tree changes that inToCont() made for a
+		 * CA certificate (adopted children) are not reverted; the CLI
+		 * exits right after a failed job. */
+		forget(certs, cert);
+		forget(keys, storedKey);
+		delete r.cert;
+		delete r.newKey;
+		qDeleteAll(staged);
+		throw;
+	}
+	certs->createSuccess(cert);
+
+	try {
+		for (staged_file *f : staged)
+			f->commit();
+	} catch (errorEx &e) {
+		qDeleteAll(staged);
+		throw errorEx(QObject::tr("Certificate '%1' was stored, but "
+			"writing its output failed: %2").arg(cert->getIntName())
+			.arg(e.getString()));
+	}
+	qDeleteAll(staged);
+	return cert;
+}
+
+/* Password prompts abort by throwing enum open_result (the Windows
+ * console throws pw_exit when no password was given). The command line
+ * turns only errorEx into a failure exit status, so every abort in the
+ * job, including the database-password check and key decryption for
+ * output.key, is translated here. */
+pki_x509 *cli_certgen(const QString &jsonfile)
+{
+	try {
+		return runJob(jsonfile);
+	} catch (enum open_result) {
+		throw errorEx(QObject::tr("Password input aborted. Give the "
+			"database password with --password"));
+	}
+}

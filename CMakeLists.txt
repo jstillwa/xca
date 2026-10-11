@@ -138,6 +138,10 @@ target_link_libraries(xcalib
     ${QT}::Widgets ${QT}::Core ${QT}::Sql ${QT}::Help
     ${ASAN_LIB}
 )
+if (WIN32)
+  # ConvertStringSecurityDescriptorToSecurityDescriptor, GetNamedSecurityInfo (secure_file.cpp)
+  target_link_libraries(xcalib advapi32)
+endif()
 target_link_libraries(xcadoc
     OpenSSL::Crypto ${QT}::Core ${ASAN_LIB}
 )

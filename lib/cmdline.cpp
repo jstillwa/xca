@@ -23,6 +23,7 @@
 #include "BioByteArray.h"
 #include "db_x509.h"
 #include "db_crl.h"
+#include "cli_sign.h"
 
 static const char *xca_name = "xca";
 static void cmd_version(FILE *fp)
@@ -62,9 +63,15 @@ static Passwd acquire_password(QString source)
 	} else if (source.startsWith("env:")) {
 		pass = getenv(source.mid(4).toLocal8Bit());
 	} else if (source.startsWith("fd:")) {
-		int fd = source.mid(3).toInt();
+		bool valid = false;
+		int fd = source.mid(3).toInt(&valid);
+		if (!valid || fd < 0)
+			throw errorEx(QObject::tr("Invalid password file descriptor '%1'")
+				.arg(source.mid(3)));
 		QFile f;
-		f.open(fd, QIODevice::ReadOnly);
+		if (!f.open(fd, QIODevice::ReadOnly))
+			throw errorEx(QObject::tr("Cannot read the password from "
+				"file descriptor %1").arg(fd));
 		pass = f.readLine(128).trimmed();
 	}
 	return pass;
@@ -207,6 +214,14 @@ int read_cmdline(int argc, char *argv[], bool console_only,
 		}
 		console_write(stdout, out.join("\n").toUtf8() + '\n');
 	}
+	if (cmd_opts.has("certgen")) {
+		try {
+			cmdline_items->append_item(cli_certgen(cmd_opts["certgen"]));
+		} catch (errorEx &err) {
+			XCA_ERROR(err);
+			return EXIT_FAILURE;
+		}
+	}
 	if (cmd_opts.has("crlgen")) {
 		db_crl *crls = Database.model<db_crl>();
 		db_x509 *certs = Database.model<db_x509>();
@@ -275,8 +290,17 @@ int read_cmdline(int argc, char *argv[], bool console_only,
 		f.close();
 	}
 	if (cmd_opts.has("import")) {
-		Database.insert(cmdline_items);
-		*_cmdline_items = nullptr;
+		/* Items created by --certgen are already stored and owned by
+		 * the item store. Importing them again would find each one as
+		 * its own duplicate and delete it while the store still holds
+		 * it. Import only the items read from files. */
+		pki_multi *to_import = new pki_multi();
+		for (pki_base *pki : cmdline_items->pull()) {
+			if (pki->getSqlItemId().isValid())
+				continue;
+			to_import->append_item(pki);
+		}
+		Database.insert(to_import);
 	}
 	return EXIT_SUCCESS;
 }

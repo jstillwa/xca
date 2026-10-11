@@ -152,13 +152,14 @@ int main(int argc, char *argv[])
 	pki_multi *cmdline_items = nullptr;
 	Entropy entropy;
 	Settings.clear();
+	int ret = EXIT_SUCCESS;
 	try {
 		initOIDs();
 	} catch (errorEx &e) {
 		XCA_ERROR(e);
+		if (console_only)
+			ret = EXIT_FAILURE;
 	}
-
-	int ret = EXIT_SUCCESS;
 
 	for (int i=0; i < argc; i++)
 		qDebug() << "wargv" << argc << i << argv[i];
@@ -187,14 +188,18 @@ int main(int argc, char *argv[])
 					gui->exec();
 				}
 			}
-		} else {
+		} else if (ret == EXIT_SUCCESS) {
 			ret = read_cmdline(argc, argv, console_only, &cmdline_items);
 			delete cmdline_items;
 		}
 	} catch (errorEx &ex) {
 		XCA_ERROR(ex);
+		if (console_only)
+			ret = EXIT_FAILURE;
 	} catch (enum open_result r) {
 		qDebug() << "DB open failed: " << r;
+		if (console_only)
+			ret = EXIT_FAILURE;
 	}
 	Database.close();
 

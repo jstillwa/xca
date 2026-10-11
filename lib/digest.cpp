@@ -7,6 +7,7 @@
 
 #include "func_base.h"
 #include "digest.h"
+#include "exception.h"
 #include "lib/base.h"
 #include <QList>
 #include <QDebug>
@@ -47,6 +48,8 @@ digest::digest(const QString &name) : md_nid(default_md)
 
 void digest::adjust(QList<int> nids)
 {
+	if (nids.isEmpty())
+		throw errorEx(QObject::tr("No supported signature hashes are available"));
 	if (!nids.contains(md_nid))
 		md_nid = nids.last();
 }

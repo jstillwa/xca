@@ -20,6 +20,8 @@
 
 
 const QList<arg_option> arguments::opts = {
+	arg_option("certgen", "json-file", file_argument, true, true,
+		"Issue or renew a certificate as described by the JSON job <json-file> and store it in the database. See the Issuing certificates section of the commandline documentation."),
 	arg_option("crlgen", "ca-identifier", required_argument, true, true,
 		"Generate CRL for <ca>. Use the 'name' option to set the internal name of the new CRL."),
 	arg_option("database", "database", file_argument, false, false,
